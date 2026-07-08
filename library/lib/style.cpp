@@ -251,7 +251,7 @@ HorizonStyle::HorizonStyle()
         .width  = 770,
         .height = 220,
 
-        .paddingTopBottom = 65,
+        .paddingTopBottom = 40,
         .paddingLeftRight = 115,
 
         .cornerRadius = 5.0f,

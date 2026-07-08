@@ -114,7 +114,6 @@ namespace inst::util {
         inst::config::parseConfig();
         primeNavigationClickAudio();
 
-        socketInitializeDefault();
         #ifdef __DEBUG__
             nxlinkStdio();
         #endif
@@ -124,7 +123,6 @@ namespace inst::util {
 
     void deinitApp () {
         nx::hdd::exit();
-        socketExit();
         awoo_usbCommsExit();
     }
 

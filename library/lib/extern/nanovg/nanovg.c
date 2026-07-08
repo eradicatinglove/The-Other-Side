@@ -26,6 +26,7 @@
 #include <nanovg/fontstash.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include <nanovg/stb_image.h>
+#include <webp/decode.h>
 
 #ifdef _MSC_VER
 #pragma warning(disable: 4100)  // unreferenced formal parameter
@@ -807,7 +808,26 @@ int nvgCreateImage(NVGcontext* ctx, const char* filename, int imageFlags)
 int nvgCreateImageMem(NVGcontext* ctx, int imageFlags, unsigned char* data, int ndata)
 {
 	int w, h, n, image;
-	unsigned char* img = stbi_load_from_memory(data, ndata, &w, &h, &n, 4);
+	unsigned char* img;
+	int isWebp = ndata > 12 &&
+		memcmp(data, "RIFF", 4) == 0 &&
+		memcmp(data + 8, "WEBP", 4) == 0;
+	if (isWebp) {
+		/* stb_image (used below for every other format) has no WebP
+		 * support at all, so anything encoded as WebP would otherwise
+		 * fail to load here with no fallback. WebPDecodeRGBA already
+		 * produces the same kind of flat RGBA buffer stb_image does,
+		 * so nvgCreateImageRGBA below doesn't need to know or care
+		 * which decoder actually produced it. */
+		img = WebPDecodeRGBA(data, (size_t)ndata, &w, &h);
+		if (img == NULL) {
+			return 0;
+		}
+		image = nvgCreateImageRGBA(ctx, w, h, imageFlags, img);
+		WebPFree(img);
+		return image;
+	}
+	img = stbi_load_from_memory(data, ndata, &w, &h, &n, 4);
 	if (img == NULL) {
 //		printf("Failed to load %s - %s\n", filename, stbi_failure_reason());
 		return 0;

@@ -5,15 +5,15 @@
 #include <vector>
 
 namespace inst::config {
-    static const std::string appDir = "sdmc:/switch/CyberFoil";
+    static const std::string appDir = "sdmc:/switch/TheOtherSide";
     static const std::string configPath = appDir + "/config.json";
     static const std::string remotesDir = appDir + "/remotes";
     static const std::string legacyShopsDir = appDir + "/shops";
     static const std::string remoteIconsDir = appDir + "/remote_icons";
     static const std::string legacyShopIconsDir = appDir + "/shop_icons";
-    static const std::string appVersion = std::string("1.0.0");
+    static const std::string appVersion = std::string(APP_VERSION_STR);
     static const std::string appGitMeta = std::string();
-    static const std::string appVersionFull = std::string("1.0.0");
+    static const std::string appVersionFull = std::string(APP_VERSION_STR);
 
     extern std::string gAuthKey;
     extern std::string lastNetUrl;

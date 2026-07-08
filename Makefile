@@ -17,8 +17,8 @@ DATA		:=	data
 ICON		:=	icon.jpg
 INCLUDES	:=	src src/include library/include external/libhaze/include
 APP_TITLE	:=	TheOtherSide
-APP_AUTHOR	:=	you
-APP_VERSION	:=	1.0.0
+APP_AUTHOR	:=	eradicatinglove
+APP_VERSION	:=	2.0.0
 
 # Borealis resources go into the RomFS
 ROMFS				:=	resources
@@ -39,6 +39,8 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ \
 			-DBOREALIS_RESOURCES="\"$(BOREALIS_RESOURCES)\""
 
+CFLAGS	+=	-DAPP_VERSION_STR=\"$(APP_VERSION)\"
+
 CXXFLAGS	:= $(CFLAGS) -std=gnu++20 -fexceptions -Wno-reorder
 
 ASFLAGS	:=	-g $(ARCH)
@@ -47,7 +49,7 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*
 # No curl/mbedtls — those portlibs were compiled against old libnx
 # with wrong TLS offsets for fw22.5.0 (same bug as original Tinfoil crash).
 # We use libnx raw BSD sockets for HTTP instead.
-LIBS	:=  -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lz -lnx -lm
+LIBS	:=  -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lz -lwebp -lnx -lm
 
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
