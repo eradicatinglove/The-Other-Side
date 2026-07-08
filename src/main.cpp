@@ -1,9 +1,13 @@
 #include <curl/curl.h>
 #include <zstd.h>
+#include <webp/decode.h>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <borealis/extern/stb_image/stb_image_write.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <switch.h>
 #include <dirent.h>
 #include <unordered_set>
@@ -22,10 +26,11 @@
 #include <atomic>
 #include <nlohmann/json.hpp>
 
-// CyberFoil install engine
+
 #include "install/install_nsp.hpp"
 #include "install/install_xci.hpp"
 #include "install/sdmc_nsp.hpp"
+#include "util/offline_title_db.hpp"
 #include "util/network_util.hpp"
 #include "util/util.hpp"
 #include "install/sdmc_xci.hpp"
@@ -44,58 +49,161 @@
 namespace i18n = brls::i18n;
 using namespace i18n::literals;
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+
 #define LOCATIONS_PATH  "sdmc:/switch/TheOtherSide/locations.conf"
 #define ICON_CACHE_DIR  "sdmc:/switch/TheOtherSide/icon_cache"
 #define LOCATIONS_DIR   "sdmc:/switch/TheOtherSide"
 #define TINCLONE_UA    "Tinfoil/20.00 (Nintendo Switch; en-US)"
 #define TINFOIL_CDN    "https://img.tinfoil.io/"
 
-// ─── Globals — same pattern as IconGrabber ────────────────────────────────────
+
+// icon cache helpers
+static std::string GetIconShardDir(const std::string& tidUpper) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : tidUpper) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    char shard[3];
+    snprintf(shard, sizeof(shard), "%02X", (unsigned)(hash % 256));
+    std::string dir = std::string(ICON_CACHE_DIR) + "/" + shard;
+    mkdir(dir.c_str(), 0777);
+    return dir;
+}
+
+
+// shop list data
 std::vector<std::string> g_titleNames;
 std::vector<std::string> g_titleIds;
 std::vector<std::string> g_titleUrls;
+
+
+std::vector<std::string> g_titleIconUrls;
+
+
+std::mutex g_titleDataMutex;
 std::string g_fetchStatus = "Loading...";
 bool g_fetchDone   = false;
 bool g_fetchCancel = false;
 std::atomic<bool> g_installInProgress{false};
 
-// In-memory set of title IDs with icons — loaded once at startup
-// to avoid 45K+ fopen calls when building the shop list.
-static std::unordered_set<std::string> g_iconCacheSet;
+
+std::atomic<int> g_activeBgThreads{0};
+struct BgThreadGuard {
+    BgThreadGuard()  { g_activeBgThreads.fetch_add(1, std::memory_order_relaxed); }
+    ~BgThreadGuard() { g_activeBgThreads.fetch_sub(1, std::memory_order_relaxed); }
+};
+
+
+std::atomic<bool> g_deferredQuitRequested{false};
+
+
+static std::unordered_map<std::string, std::string> g_iconCacheSet;
 static bool g_iconCacheSetLoaded = false;
+
+
+static std::mutex g_iconCacheSetMutex;
 static void loadIconCacheSet() {
     if (g_iconCacheSetLoaded) return;
     g_iconCacheSetLoaded = true;
+
+    auto scanDir = [](const std::string& path) {
+        DIR* d = opendir(path.c_str());
+        if (!d) return;
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            std::string name(e->d_name);
+            if (name.size() > 4 && (name.substr(name.size()-4) == ".jpg" || name.substr(name.size()-4) == ".png")) {
+                std::string ext = name.substr(name.size()-4);
+                std::string tid = name.substr(0, name.size()-4);
+                for (auto& c : tid) c = toupper(c);
+                g_iconCacheSet.emplace(tid, ext);
+            } else if (name.size() > 5 && name.substr(name.size()-5) == ".webp") {
+                std::string tid = name.substr(0, name.size()-5);
+                for (auto& c : tid) c = toupper(c);
+                g_iconCacheSet.emplace(tid, ".webp");
+            }
+        }
+        closedir(d);
+    };
+
+
+    DIR* top = opendir(ICON_CACHE_DIR);
+    if (!top) return;
+    std::vector<std::string> subdirs;
+    struct dirent* e;
+    while ((e = readdir(top)) != nullptr) {
+        std::string name(e->d_name);
+        if (name == "." || name == "..") continue;
+        bool isDir = e->d_type == DT_DIR;
+        if (e->d_type == DT_UNKNOWN) {
+
+
+            struct stat st;
+            isDir = stat((std::string(ICON_CACHE_DIR) + "/" + name).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        }
+        if (isDir)
+            subdirs.push_back(std::string(ICON_CACHE_DIR) + "/" + name);
+    }
+    closedir(top);
+
+    scanDir(ICON_CACHE_DIR);
+    for (auto& sub : subdirs) scanDir(sub);
+}
+
+
+static int migrateIconCacheToShards(const std::function<void(int,int)>& progressCb) {
     DIR* d = opendir(ICON_CACHE_DIR);
-    if (!d) return;
+    if (!d) return 0;
+    std::vector<std::string> filesToMove;
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
         std::string name(e->d_name);
-        if (name.size() > 4 && name.substr(name.size()-4) == ".jpg") {
-            std::string tid = name.substr(0, name.size()-4);
-            for (auto& c : tid) c = toupper(c);
-            g_iconCacheSet.insert(tid);
+        if (name == "." || name == "..") continue;
+        if (e->d_type == DT_DIR) continue;
+        if (e->d_type == DT_UNKNOWN) {
+            struct stat st;
+            if (stat((std::string(ICON_CACHE_DIR) + "/" + name).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                continue;
+        }
+        if ((name.size() > 4 && (name.substr(name.size()-4) == ".jpg" || name.substr(name.size()-4) == ".png")) ||
+            (name.size() > 5 && name.substr(name.size()-5) == ".webp")) {
+            filesToMove.push_back(name);
         }
     }
     closedir(d);
+
+    int moved = 0;
+    int total = (int)filesToMove.size();
+    for (int i = 0; i < total; i++) {
+        const std::string& name = filesToMove[i];
+        std::string tid, ext;
+        if (name.size() > 5 && name.substr(name.size()-5) == ".webp") {
+            tid = name.substr(0, name.size()-5);
+            ext = ".webp";
+        } else {
+            tid = name.substr(0, name.size()-4);
+            ext = name.substr(name.size()-4);
+        }
+        for (auto& c : tid) c = toupper(c);
+        std::string oldPath = std::string(ICON_CACHE_DIR) + "/" + name;
+        std::string newPath = GetIconShardDir(tid) + "/" + tid + ext;
+        if (rename(oldPath.c_str(), newPath.c_str()) == 0) moved++;
+        if (progressCb && (i % 200 == 0 || i == total - 1))
+            progressCb(i + 1, total);
+    }
+    return moved;
 }
 
-// When a download completes, the background thread sets this to the temp
-// file path. The IconApplyTask drains it on the UI thread and shows the
-// install dialog. Empty string means no pending install.
+
 std::string g_pendingInstallPath;
 std::string g_pendingInstallName;
 
-// Credentials for the currently-active shop — set when its index is
-// successfully fetched, used by the install path to authenticate range
-// requests. Without this, shops requiring HTTP Basic Auth (username/password)
-// would populate titles fine but fail every install with rc=1 since the
-// range request goes out with no credentials attached.
+
 std::string g_shopUser;
 std::string g_shopPass;
 
-// ─── curl helpers — copied directly from IconGrabber ─────────────────────────
+
 size_t write_to_string(void* ptr, size_t size, size_t nmemb, std::string* stream) {
     stream->append(static_cast<const char*>(ptr), size * nmemb);
     return size * nmemb;
@@ -104,6 +212,7 @@ size_t write_to_file(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     return fwrite(ptr, size, nmemb, stream);
 }
 
+// network stuff
 std::string httpGet(const std::string& url,
                     const std::string& user = "",
                     const std::string& pass = "") {
@@ -121,7 +230,15 @@ std::string httpGet(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_to_string);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response);
 
-    // Tinfoil shop auth headers - required by most shops including nx-retro
+
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+            return g_fetchCancel ? 1 : 0;
+        });
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
+
+
     struct curl_slist* headers = nullptr;
     std::string hauthVal = "HAUTH: " + inst::util::ComputeHauthFromUrl(url);
     std::string uauthVal = "UAUTH: " + inst::util::ComputeUauthFromUrl(url, user, pass);
@@ -144,7 +261,7 @@ std::string httpGet(const std::string& url,
     long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     if (headers) curl_slist_free_all(headers);
-    // Write debug info
+
     mkdir("sdmc:/switch/TheOtherSide", 0777);
     FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
     if (dbg) {
@@ -161,26 +278,17 @@ std::string httpGet(const std::string& url,
     return response;
 }
 
-// ─── Tinfoil compressed index decoder ─────────────────────────────────────────
-// Real Tinfoil shop responses are not always plain JSON. Many shops (cyrilz87,
-// likely Ghost eShop too) send a binary container:
-//   bytes 0-7:    magic "TINFOIL\r"
-//   bytes 8-263:  reserved/padding
-//   bytes 264-271: little-endian 8-byte size field
-//   bytes 272+:   zstd-compressed frame containing the actual JSON
-// This decompresses that container into the underlying JSON text. If the
-// input isn't in this format (no magic header), it's returned unchanged so
-// plain-JSON shops keep working exactly as before.
+
 std::string decodeTinfoilResponse(const std::string& raw) {
     static const char kMagic[] = "TINFOIL";
-    static const size_t kMagicLen = 7; // not including the trailing \r
+    static const size_t kMagicLen = 7;
     static const size_t kZstdPayloadOffset = 272;
 
     if (raw.size() < kMagicLen || raw.compare(0, kMagicLen, kMagic) != 0)
-        return raw; // not a compressed container, treat as plain text
+        return raw;
 
     if (raw.size() <= kZstdPayloadOffset)
-        return raw; // malformed/too short, bail out and let caller see raw bytes
+        return raw;
 
     const char* payload = raw.data() + kZstdPayloadOffset;
     size_t payloadLen = raw.size() - kZstdPayloadOffset;
@@ -190,17 +298,14 @@ std::string decodeTinfoilResponse(const std::string& raw) {
         if (dbg) { fprintf(dbg, "%s\n", msg); fclose(dbg); }
     };
 
-    // Streaming decompression: don't trust the frame's declared content size
-    // (some shop-generated frames report it incorrectly or as unknown), just
-    // keep feeding input and growing the output buffer until the stream
-    // reports the frame is fully consumed.
+
     ZSTD_DStream* dstream = ZSTD_createDStream();
     if (!dstream) { logErr("zstd: failed to create DStream"); return ""; }
     ZSTD_initDStream(dstream);
 
     ZSTD_inBuffer in = { payload, payloadLen, 0 };
     std::string out;
-    out.resize(std::max<size_t>(payloadLen * 4, 1 << 20)); // start at 1MB or 4x payload
+    out.resize(std::max<size_t>(payloadLen * 4, 1 << 20));
     size_t outFilled = 0;
 
     size_t ret = 0;
@@ -220,7 +325,7 @@ std::string decodeTinfoilResponse(const std::string& raw) {
             ZSTD_freeDStream(dstream);
             return "";
         }
-        if (ret == 0) { frameComplete = true; break; } // full frame decoded
+        if (ret == 0) { frameComplete = true; break; }
     } while (in.pos < in.size);
 
     ZSTD_freeDStream(dstream);
@@ -243,33 +348,32 @@ std::string decodeTinfoilResponse(const std::string& raw) {
     return out;
 }
 
-// ─── Icon index (titledb) ───────────────────────────────────────────────────
-// Real Tinfoil shops don't carry icon URLs in their index — only
-// {"url":..., "size":...} per title. Box art comes from a SEPARATE source:
-// blawar's community titledb (US.en.json, ~82MB), where each entry looks like
-//   "<nsuId>": { "id": "<16-char title ID>", "iconUrl": "https://img-eshop.cdn.nintendo.net/...", ... }
-// Note the outer key is an internal nsuId, NOT the title ID — the title ID is
-// the "id" field inside each object. This was confirmed against a real
-// sample record before writing this parser (not guessed).
-//
-// Since the source file is ~82MB, we never hold the whole thing in memory:
-// we SAX-parse it as it downloads and write only "id|iconUrl\n" pairs to a
-// compact local index file (a few MB instead of 82), which IS small enough
-// to load fully into a std::unordered_map for fast lookup afterward.
+
 #define ICON_INDEX_PATH  "sdmc:/switch/TheOtherSide/icon_index.txt"
 #define ICON_CACHE_DIR   "sdmc:/switch/TheOtherSide/icon_cache"
 #define TITLEDB_URL      "https://github.com/blawar/titledb/raw/refs/heads/master/US.en.json"
 
-// ─── Icon system ─────────────────────────────────────────────────────────────
-// "Build icon index" downloads blawar's US.en.json (~80MB, once) and extracts
-// titleId|iconUrl pairs into a compact local file (icon_index.txt, ~3MB).
-// fetchShopIconForTitle() looks up the iconUrl, downloads the JPEG from
-// Nintendo's CDN, and caches it to SD card. Subsequent views are instant.
 
-// In-memory index: titleId (uppercase hex) -> CDN icon URL
 static std::unordered_map<std::string, std::string> g_iconIndex;
 static bool g_iconIndexLoaded = false;
 static std::mutex g_iconIndexMutex;
+
+
+static std::atomic<bool> g_iconIndexBuildInProgress{false};
+
+
+static std::atomic<int> g_activeIconFetches{0};
+constexpr int kMaxConcurrentIconFetches = 6;
+
+
+static std::atomic<uint64_t> g_hasIconTicksAccum{0};
+
+
+static std::atomic<uint64_t> g_statTicksAccum{0};
+static std::atomic<uint64_t> g_readTicksAccum{0};
+
+
+static std::atomic<bool> g_iconCacheMigrationInProgress{false};
 
 static void loadIconIndexIfNeeded() {
     std::lock_guard<std::mutex> lock(g_iconIndexMutex);
@@ -290,13 +394,12 @@ static void loadIconIndexIfNeeded() {
     if (dbg) { fprintf(dbg, "icon index loaded: %zu entries\n", g_iconIndex.size()); fclose(dbg); }
 }
 
-// Downloads titledb and builds the compact icon_index.txt.
-// Called from a background thread via the "Build icon index" Options button.
+
 bool buildIconIndex() {
     FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
     if (dbg) { fprintf(dbg, "icon index: starting download\n"); fclose(dbg); }
 
-    // Download to temp file to avoid 80MB in RAM
+
     std::string tmpPath = "sdmc:/switch/TheOtherSide/titledb_tmp.json";
     FILE* tmpFile = fopen(tmpPath.c_str(), "wb");
     if (!tmpFile) return false;
@@ -304,12 +407,31 @@ bool buildIconIndex() {
     CURL* curl = curl_easy_init();
     if (!curl) { fclose(tmpFile); return false; }
     curl_easy_setopt(curl, CURLOPT_URL, TITLEDB_URL);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, TINCLONE_UA);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_file);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, tmpFile);
+
+
+    static uint64_t s_idx_last = 0; s_idx_last = 0;
+    auto idxXferFunc = +[](void*, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) -> int {
+        if (dltotal <= 0 || dlnow <= 0) return 0;
+        uint64_t now = (uint64_t)dlnow;
+        if (now - s_idx_last >= 1024*1024) {
+            s_idx_last = now;
+            double pct = 100.0*dlnow/dltotal;
+            char msg[48]; snprintf(msg, sizeof(msg), "Building icon index: %.0f%%", pct);
+            std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+            g_pendingNotifications.push_back(msg);
+        }
+        return 0;
+    };
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, idxXferFunc);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
     CURLcode res = curl_easy_perform(curl);
     long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
@@ -323,11 +445,11 @@ bool buildIconIndex() {
         return false;
     }
 
-    // SAX parse the JSON and extract id|iconUrl pairs
+
     FILE* outIdx = fopen(ICON_INDEX_PATH, "wb");
     if (!outIdx) { remove(tmpPath.c_str()); return false; }
 
-    // Simple line-by-line scan — faster than full JSON parse on Switch
+
     FILE* in = fopen(tmpPath.c_str(), "r");
     if (!in) { fclose(outIdx); remove(tmpPath.c_str()); return false; }
 
@@ -336,7 +458,7 @@ bool buildIconIndex() {
     std::string curId, curIcon;
     while (fgets(line, sizeof(line), in)) {
         std::string s(line);
-        // Extract "id": "XXXX"
+
         size_t idPos = s.find("\"id\":");
         if (idPos != std::string::npos) {
             size_t q1 = s.find('"', idPos + 5);
@@ -344,7 +466,7 @@ bool buildIconIndex() {
             if (q1 != std::string::npos && q2 != std::string::npos)
                 curId = s.substr(q1 + 1, q2 - q1 - 1);
         }
-        // Extract "iconUrl": "https://..."
+
         size_t iconPos = s.find("\"iconUrl\":");
         if (iconPos != std::string::npos) {
             size_t q1 = s.find('"', iconPos + 10);
@@ -352,9 +474,9 @@ bool buildIconIndex() {
             if (q1 != std::string::npos && q2 != std::string::npos)
                 curIcon = s.substr(q1 + 1, q2 - q1 - 1);
         }
-        // When we have both, write the pair
+
         if (!curId.empty() && !curIcon.empty()) {
-            // Convert id to uppercase
+
             for (auto& c : curId) c = toupper(c);
             fprintf(outIdx, "%s|%s\n", curId.c_str(), curIcon.c_str());
             written++;
@@ -366,7 +488,7 @@ bool buildIconIndex() {
     fclose(outIdx);
     remove(tmpPath.c_str());
 
-    // Reload the index
+
     {
         std::lock_guard<std::mutex> lock(g_iconIndexMutex);
         g_iconIndex.clear();
@@ -379,20 +501,17 @@ bool buildIconIndex() {
     return written > 0;
 }
 
-// Fetch icon JPEG for a title. Checks disk cache first, then looks up the
-// CDN URL from the index and downloads from Nintendo's servers.
+
 std::string fetchShopIconForTitle(const std::string& titleId) {
     if (titleId.empty()) return "";
 
-    // Normalize to uppercase
+
     std::string tid = titleId;
     for (auto& c : tid) c = toupper(c);
 
-    // Check disk cache only — no network requests.
-    // Icons are pre-populated in icon_cache/ from the Ubuntu download script.
-    // This keeps the shop list fast with no background network stalls.
+
     mkdir(ICON_CACHE_DIR, 0777);
-    std::string cachePath = std::string(ICON_CACHE_DIR) + "/" + tid + ".jpg";
+    std::string cachePath = GetIconShardDir(tid) + "/" + tid + ".jpg";
     FILE* cf = fopen(cachePath.c_str(), "rb");
     if (!cf) return "";
     fseek(cf, 0, SEEK_END);
@@ -406,31 +525,28 @@ std::string fetchShopIconForTitle(const std::string& titleId) {
 }
 
 
-
-
-
-// ─── Icon apply queue ─────────────────────────────────────────────────────────
-// Background icon-fetch threads push results here; IconApplyTask drains on UI
-// thread where setThumbnail() and notify() are safe to call.
 struct PendingIcon { std::string titleId; std::string iconBytes; uint64_t generation; };
 static std::vector<PendingIcon> g_pendingIcons;
 std::vector<std::string> g_pendingNotifications;
 std::mutex g_pendingIconsMutex;
 
-// Tracks which ListItem*s are visible for each title ID so the apply task
-// can find them after the background fetch completes.
+
 static std::map<std::string, std::vector<brls::ListItem*>> g_visibleShopItems;
 static std::atomic<uint64_t> g_shopScreenGeneration{0};
 
-// Forward declaration
+
 void frame_showFileBrowser(const std::string& path);
 void frame_showShop(const std::string& category, const std::string& typeFilter = "all");
+
+static bool g_iconApplyTaskStopped = false;
 
 class IconApplyTask : public brls::RepeatingTask {
 public:
     IconApplyTask() : brls::RepeatingTask(0) {}
+    ~IconApplyTask() {}
     void run(retro_time_t currentTime) override {
         brls::RepeatingTask::run(currentTime);
+        if (g_iconApplyTaskStopped) return;
 
         std::vector<std::string> notifications;
         std::string installPath, installName;
@@ -446,17 +562,18 @@ public:
         }
         for (auto& msg : notifications) {
             if (msg.substr(0, 7) == "UPDATE:") {
-                // Format: UPDATE:v1.0.1:1.0.1
+
                 size_t c1 = msg.find(':', 7);
                 std::string tag = msg.substr(7, c1 - 7);
                 std::string ver = msg.substr(c1 + 1);
-                brls::Dialog* dlg = new brls::Dialog("Update available!\n\n" + tag + " is available.\nYou have v" APP_VERSION ".\n\nUpdate now?");
+                brls::Dialog* dlg = new brls::Dialog("Update available!\n\n" + tag + " is available.\nYou have v" + inst::config::appVersion + ".\n\nUpdate now?");
                 dlg->addButton("Update", [dlg, tag](brls::View*) {
                     dlg->close([tag]() {
-                        // Download new NRO
+
                         brls::Application::notify("Downloading update...");
                         thrd_t t;
                         thrd_create(&t, [](void* p) -> int {
+                            BgThreadGuard bgGuard;
                             std::string* ptag = static_cast<std::string*>(p);
                             std::string dlUrl = "https://github.com/eradicatinglove/The-Other-Side/releases/download/" + *ptag + "/TheOtherSide.nro";
                             delete ptag;
@@ -467,7 +584,8 @@ public:
                                 g_pendingNotifications.push_back("Update download failed");
                                 return 0;
                             }
-                            FILE* f = fopen("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro", "wb");
+                            std::string tmpNro = "sdmc:/switch/TheOtherSide/TheOtherSide_update.nro";
+                            FILE* f = fopen(tmpNro.c_str(), "wb");
                             if (!f) { curl_easy_cleanup(curl); return 0; }
 
                             static uint64_t s_upd_last = 0; s_upd_last = 0;
@@ -487,8 +605,14 @@ public:
                             curl_easy_setopt(curl, CURLOPT_URL, dlUrl.c_str());
                             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
                             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                            curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
                             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-                            curl_easy_setopt(curl, CURLOPT_USERAGENT, "TheOtherSide/" APP_VERSION);
+                            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+                            curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512L * 1024L);
+                            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+                            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+                            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 45L);
+                            { std::string ua = "TheOtherSide/" + inst::config::appVersion; curl_easy_setopt(curl, CURLOPT_USERAGENT, ua.c_str()); }
                             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_file);
                             curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
                             curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -499,14 +623,27 @@ public:
                             fclose(f);
 
                             if (res == CURLE_OK) {
-                                // Replace current NRO
-                                remove("sdmc:/switch/TheOtherSide/TheOtherSide.nro");
-                                rename("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro",
-                                       "sdmc:/switch/TheOtherSide/TheOtherSide.nro");
-                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                                g_pendingNotifications.push_back("Update installed! Restart the app.");
+                                FILE* dbgUpd = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+                                if (dbgUpd) { fprintf(dbgUpd, "update downloaded\n"); fclose(dbgUpd); }
+
+
+                                struct stat dlSt;
+                                bool dlLooksSane = stat(tmpNro.c_str(), &dlSt) == 0 && dlSt.st_size > 100000;
+
+                                if (dlLooksSane) {
+
+
+                                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                    g_pendingNotifications.push_back("Update downloaded! Please restart the app to finish updating.");
+                                } else {
+                                    remove(tmpNro.c_str());
+                                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                    g_pendingNotifications.push_back("Update download looked incomplete — please try again");
+                                }
                             } else {
-                                remove("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro");
+                                FILE* dbgUpd = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+                                if (dbgUpd) { fprintf(dbgUpd, "update download failed: rc=%d\n", res); fclose(dbgUpd); }
+                                remove(tmpNro.c_str());
                                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                                 g_pendingNotifications.push_back("Update download failed");
                             }
@@ -544,7 +681,15 @@ public:
         {
             std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
             if (g_pendingIcons.empty()) return;
-            batch.swap(g_pendingIcons);
+
+
+            constexpr size_t kMaxIconsAppliedPerFrame = 4;
+            if (g_pendingIcons.size() <= kMaxIconsAppliedPerFrame) {
+                batch.swap(g_pendingIcons);
+            } else {
+                batch.assign(g_pendingIcons.end() - kMaxIconsAppliedPerFrame, g_pendingIcons.end());
+                g_pendingIcons.resize(g_pendingIcons.size() - kMaxIconsAppliedPerFrame);
+            }
         }
         for (auto& p : batch) {
             if (p.generation != g_shopScreenGeneration.load()) continue;
@@ -565,26 +710,25 @@ static void ensureIconApplyTaskRunning() {
     }
 }
 
-// ─── locations.conf parser ────────────────────────────────────────────────────
+
+enum class ShopFormat : int { TinfoilLegacy = 0, CyberFoil = 1 };
+
 struct Location {
     std::string protocol, url, port, username, password, path;
+    ShopFormat format = ShopFormat::TinfoilLegacy;
 };
 
-// Strips any "scheme://" prefix and trailing path from a user-entered string,
-// so loc.url always holds a bare host (e.g. "nx-retro.ghostland.at"), never a
-// full URL. Without this, doFetch()'s "proto + \"://\" + loc.url" concatenation
-// produces malformed URLs like "https://https://host" (CURLcode 6) whenever a
-// caller stores a full URL instead of a bare host.
+
 static std::string sanitizeHostInput(std::string input) {
-    // Strip scheme
+
     size_t schemePos = input.find("://");
     if (schemePos != std::string::npos)
         input = input.substr(schemePos + 3);
-    // Strip any path/query/fragment that came along with a pasted full URL
+
     size_t pathPos = input.find_first_of("/?#");
     if (pathPos != std::string::npos)
         input = input.substr(0, pathPos);
-    // Trim whitespace
+
     size_t start = input.find_first_not_of(" \t\r\n");
     size_t end   = input.find_last_not_of(" \t\r\n");
     if (start == std::string::npos) return "";
@@ -592,19 +736,20 @@ static std::string sanitizeHostInput(std::string input) {
 }
 
 void saveLocations(const std::vector<Location>& locs) {
-    // ensure directory exists
+
     mkdir(LOCATIONS_DIR, 0777);
     FILE* f = fopen(LOCATIONS_PATH, "w");
     if (!f) return;
     FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
     for (auto& loc : locs) {
-        fprintf(f, "%s|%s|%s|%s|%s|%s\n",
+        fprintf(f, "%s|%s|%s|%s|%s|%s|%d\n",
             loc.protocol.c_str(), loc.url.c_str(), loc.port.c_str(),
-            loc.username.c_str(), loc.password.c_str(), loc.path.c_str());
+            loc.username.c_str(), loc.password.c_str(), loc.path.c_str(),
+            (int)loc.format);
         if (dbg)
-            fprintf(dbg, "saveLocations: proto=[%s] url=[%s] port=[%s] user=[%s] path=[%s]\n",
+            fprintf(dbg, "saveLocations: proto=[%s] url=[%s] port=[%s] user=[%s] path=[%s] format=[%d]\n",
                 loc.protocol.c_str(), loc.url.c_str(), loc.port.c_str(),
-                loc.username.c_str(), loc.path.c_str());
+                loc.username.c_str(), loc.path.c_str(), (int)loc.format);
     }
     if (dbg) fclose(dbg);
     fclose(f);
@@ -612,13 +757,13 @@ void saveLocations(const std::vector<Location>& locs) {
 
 std::vector<Location> loadLocations() {
     std::vector<Location> locs;
-    // No default shop is auto-seeded; locations.conf starts empty if missing
-    // and the user adds shops manually via Options.
+
+
     FILE* test = fopen(LOCATIONS_PATH, "r");
     if (!test) {
         mkdir(LOCATIONS_DIR, 0777);
         FILE* f = fopen(LOCATIONS_PATH, "w");
-        if (f) fclose(f); // create empty file
+        if (f) fclose(f);
         test = fopen(LOCATIONS_PATH, "r");
         if (!test) return locs;
     }
@@ -630,9 +775,8 @@ std::vector<Location> loadLocations() {
         if (!len || line[0]=='#') continue;
         Location loc;
         std::vector<std::string> parts;
-        // strtok skips consecutive delimiters, collapsing empty fields.
-        // Use a manual split that preserves them so port/user/pass/path
-        // columns stay aligned even when empty.
+
+
         std::string lineStr(line);
         size_t pos = 0;
         while (true) {
@@ -650,13 +794,23 @@ std::vector<Location> loadLocations() {
         if (parts.size() > 3) loc.username = parts[3];
         if (parts.size() > 4) loc.password = parts[4];
         if (parts.size() > 5) loc.path     = parts[5];
+        if (parts.size() > 6 && !parts[6].empty()) {
+
+            loc.format = (parts[6] == "1") ? ShopFormat::CyberFoil : ShopFormat::TinfoilLegacy;
+        } else {
+
+
+            loc.format = (loc.url.find("ghostland.at") != std::string::npos)
+                ? ShopFormat::CyberFoil : ShopFormat::TinfoilLegacy;
+        }
         if (!loc.url.empty()) locs.push_back(loc);
     }
     fclose(f);
     return locs;
 }
 
-// ─── Shop fetch thread ────────────────────────────────────────────────────────
+
+// grabs the shop listings on startup
 void doFetch() {
     auto locs = loadLocations();
     if (locs.empty()) {
@@ -664,7 +818,7 @@ void doFetch() {
         g_fetchDone   = true;
         return;
     }
-    // Check network is available before trying
+
     {
         NifmInternetConnectionType connType;
         u32 wifiStrength;
@@ -689,8 +843,7 @@ void doFetch() {
 
         std::string json;
 
-        // Try Tinfoil shop format first (root URL)
-        // Build full URL from host + path
+
         std::string proto = loc.protocol.empty() ? "https" : loc.protocol;
         for (auto& c : proto) c = tolower(c);
         std::string rootUrl = proto + "://" + loc.url;
@@ -701,10 +854,24 @@ void doFetch() {
         }
         if (!rootUrl.empty() && rootUrl.back() == '/') rootUrl.pop_back();
 
-        // Ghost eShop — use CyberFoil's /api/shop/sections endpoint with
-        // headers captured via mitmproxy. HAUTH is hostname-specific.
-        if (loc.url.find("ghostland.at") != std::string::npos) {
-            std::string ghostUrl = proto + "://nx.ghostland.at/api/shop/sections";
+
+        bool isGhostland = loc.url.find("ghostland.at") != std::string::npos;
+        if (isGhostland || loc.format == ShopFormat::CyberFoil) {
+            std::string cfUrl;
+            std::string hauthHeader;
+            if (isGhostland) {
+                cfUrl = proto + "://nx.ghostland.at/api/shop/sections";
+                hauthHeader = "HAUTH: D0634E67FCF4DBD14DA344ACDC45E4BE";
+            } else {
+
+
+                cfUrl = loc.path.empty()
+                    ? (proto + "://" + loc.url + (loc.port.empty() ? "" : (":" + loc.port)) + "/api/shop/sections")
+                    : rootUrl;
+
+
+                hauthHeader = "HAUTH: " + inst::util::ComputeHauthFromUrl(cfUrl);
+            }
             std::string uid = inst::util::ComputeUidFromMmcCid();
 
             struct curl_slist* gh = nullptr;
@@ -712,15 +879,15 @@ void doFetch() {
             gh = curl_slist_append(gh, "Version: 1.4");
             gh = curl_slist_append(gh, "Revision: 5");
             gh = curl_slist_append(gh, "Language: en");
-            gh = curl_slist_append(gh, "HAUTH: D0634E67FCF4DBD14DA344ACDC45E4BE");
-            std::string ua = "UAUTH: " + inst::util::ComputeUauthFromUrl(ghostUrl, loc.username, loc.password);
+            gh = curl_slist_append(gh, hauthHeader.c_str());
+            std::string ua = "UAUTH: " + inst::util::ComputeUauthFromUrl(cfUrl, loc.username, loc.password);
             gh = curl_slist_append(gh, ua.c_str());
             std::string ui = "UID: " + uid;
             gh = curl_slist_append(gh, ui.c_str());
 
             CURL* curl = curl_easy_init();
             if (curl) {
-                curl_easy_setopt(curl, CURLOPT_URL, ghostUrl.c_str());
+                curl_easy_setopt(curl, CURLOPT_URL, cfUrl.c_str());
                 curl_easy_setopt(curl, CURLOPT_USERAGENT, "cyberfoil");
                 curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
                 curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -731,16 +898,29 @@ void doFetch() {
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, gh);
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_string);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &json);
+
+
+                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+                    +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                        return g_fetchCancel ? 1 : 0;
+                    });
+                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
                 CURLcode res = curl_easy_perform(curl);
                 long httpCode = 0;
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
                 curl_easy_cleanup(curl);
                 FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                if (dbg) { fprintf(dbg, "Ghost eShop: rc=%d http=%ld size=%zu\n", res, httpCode, json.size()); fclose(dbg); }
+                if (dbg) {
+                    fprintf(dbg, "%s: rc=%d http=%ld size=%zu\n",
+                            isGhostland ? "Ghost eShop" : ("CyberFoil shop [" + loc.url + "]").c_str(),
+                            res, httpCode, json.size());
+                    fclose(dbg);
+                }
             }
             curl_slist_free_all(gh);
 
-            // Parse CyberFoil sections format: {"sections":[{"items":[{...}]}]}
+
             if (!json.empty() && json.find("\"sections\"") != std::string::npos) {
                 size_t pos = 0;
                 while ((pos = json.find("\"title_id\"", pos)) != std::string::npos) {
@@ -766,8 +946,10 @@ void doFetch() {
                     std::string tid = getF("title_id");
                     std::string name = getF("name");
                     std::string url = getF("url");
+                    std::string iconUrl = getF("icon_url");
+
                     if (!tid.empty() && !name.empty() && !url.empty()) {
-                        // Resolve jbod: URLs
+
                         if (url.size() > 5 && url.substr(0, 5) == "jbod:") {
                             size_t slash = url.find('/', 5);
                             if (slash != std::string::npos) {
@@ -784,14 +966,23 @@ void doFetch() {
                                 url = decoded;
                             }
                         }
-                        g_titleNames.push_back(name);
-                        g_titleIds.push_back(tid);
-                        g_titleUrls.push_back(url);
+                        {
+                            std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                            g_titleNames.push_back(name);
+                            g_titleIds.push_back(tid);
+                            g_titleUrls.push_back(url);
+                            g_titleIconUrls.push_back(iconUrl);
+                        }
                     }
                     pos = objEnd + 1;
                 }
-                if (!g_titleNames.empty()) {
-                    g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+                bool anyTitles;
+                {
+                    std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                    anyTitles = !g_titleNames.empty();
+                    if (anyTitles) g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+                }
+                if (anyTitles) {
                     g_fetchDone = true;
                     return;
                 }
@@ -802,9 +993,7 @@ void doFetch() {
 
         json = httpGet(rootUrl, loc.username, loc.password);
 
-        // Many shops (cyrilz87, possibly Ghost eShop) send a binary
-        // "TINFOIL\r" + zstd-compressed container instead of plain JSON.
-        // Decode it here so the parser below always sees real JSON text.
+
         if (!json.empty() && json.compare(0, 7, "TINFOIL") == 0) {
             std::string decoded = decodeTinfoilResponse(json);
             FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
@@ -816,10 +1005,8 @@ void doFetch() {
         }
 
 
-
-        // If that returns Tinfoil JSON with "files" key, parse it differently
         if (!json.empty() && json.find("\"files\"") != std::string::npos) {
-            // Tinfoil shop format: {"files":[{"url":"...","size":...}]}
+
             size_t filesPos = json.find("\"files\"");
             size_t arrStart = json.find('[', filesPos);
             size_t arrEnd   = json.rfind(']');
@@ -844,9 +1031,7 @@ void doFetch() {
                     std::string url = getF("url");
                     if (url.empty()) continue;
 
-                    // If the URL is relative (no scheme), prepend the shop's
-                    // base URL so the installer gets a full absolute URL.
-                    // e.g. "NSPdir/game.nsp" -> "https://host:5001/NSPdir/game.nsp"
+
                     bool isAbsolute = url.find("://") != std::string::npos
                                    || url.substr(0,7) == "gdrive:"
                                    || url.substr(0,4) == "ftp:";
@@ -858,11 +1043,11 @@ void doFetch() {
                         if (!url.empty() && url[0] != '/') base += "/";
                         url = base + url;
                     }
-                    // Extract name from URL
+
                     std::string name = url;
                     size_t sl = name.rfind('/');
                     if (sl != std::string::npos) name = name.substr(sl + 1);
-                    // URL decode %20 etc
+
                     std::string decoded;
                     for (size_t i = 0; i < name.size(); i++) {
                         if (name[i] == '%' && i + 2 < name.size()) {
@@ -872,7 +1057,7 @@ void doFetch() {
                             i += 2;
                         } else decoded += name[i];
                     }
-                    // Extract title ID
+
                     std::string tid, cleanName = decoded;
                     size_t lb = decoded.find('[');
                     size_t rb = decoded.find(']', lb != std::string::npos ? lb : 0);
@@ -882,16 +1067,21 @@ void doFetch() {
                     while (nameEnd > 0 && (decoded[nameEnd-1]==' '||decoded[nameEnd-1]=='.')) nameEnd--;
                     if (nameEnd > 0) cleanName = decoded.substr(0, nameEnd);
                     if (!url.empty()) {
+                        std::lock_guard<std::mutex> lock(g_titleDataMutex);
                         g_titleNames.push_back(cleanName.empty() ? decoded : cleanName);
                         g_titleIds.push_back(tid);
                         g_titleUrls.push_back(url);
+                        g_titleIconUrls.push_back("");
                     }
                 }
             }
-            g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+            {
+                std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+            }
             g_fetchDone = true;
-            // Save credentials from this shop so install requests can
-            // authenticate their range requests against the same server.
+
+
             g_shopUser = loc.username;
             g_shopPass = loc.password;
             tin::network::SetBasicAuth(g_shopUser, g_shopPass);
@@ -903,24 +1093,24 @@ void doFetch() {
             continue;
         }
 
-        // Handle tinfoil forwarder format: {"locations":{"host":{"path":"..."}}}
+
         if (json.find("\"locations\"") != std::string::npos) {
-            // This is a forwarder - parse and fetch each location
-            // Simple approach: find all "host" keys and their paths
+
+
             size_t locPos = json.find("\"locations\"");
             size_t objStart = json.find('{', locPos + 10);
             if (objStart != std::string::npos) {
-                // Each key is a hostname
+
                 size_t p = objStart + 1;
                 while (p < json.size() && p < objStart + 50000) {
-                    // Find next quoted key (hostname)
+
                     size_t ks = json.find('"', p);
                     if (ks == std::string::npos) break;
                     size_t ke = json.find('"', ks + 1);
                     if (ke == std::string::npos) break;
                     std::string host = json.substr(ks + 1, ke - ks - 1);
                     if (host.empty() || host[0] == '}') { p = ke + 1; continue; }
-                    // Find path value
+
                     std::string path;
                     size_t pathKey = json.find("\"path\"", ke);
                     size_t nextHost = json.find('"', ke + 2);
@@ -938,8 +1128,8 @@ void doFetch() {
                         if (!fwdJson.empty() && fwdJson.compare(0, 7, "TINFOIL") == 0)
                             fwdJson = decodeTinfoilResponse(fwdJson);
                         if (!fwdJson.empty() && fwdJson.find("\"files\"") != std::string::npos) {
-                            // Parse files from this forwarded location
-                            // (reuse the files parser below by appending to json)
+
+
                             json += fwdJson;
                         }
                     }
@@ -948,7 +1138,7 @@ void doFetch() {
             }
         }
 
-        // Parse NUT JSON entries
+
         size_t pos = 0;
         while ((pos = json.find("{\"url\"", pos)) != std::string::npos) {
             size_t end = json.find('}', pos);
@@ -956,7 +1146,7 @@ void doFetch() {
             std::string obj = json.substr(pos, end-pos+1);
             pos = end+1;
 
-            // Extract url field
+
             std::string url, name;
             auto getField = [&](const std::string& key) {
                 std::string needle = "\"" + key + "\"";
@@ -977,34 +1167,37 @@ void doFetch() {
                 url += name;
             }
 
-            // Extract title ID from name [TITLEID][vVER].nsp
+
             std::string tid;
             size_t lb = name.find('[');
             size_t rb = name.find(']', lb != std::string::npos ? lb : 0);
             if (lb != std::string::npos && rb != std::string::npos && rb-lb-1 == 16)
                 tid = name.substr(lb+1, 16);
 
-            // Clean name
+
             std::string cleanName = name;
             size_t nameEnd = lb != std::string::npos ? lb : name.size();
             while (nameEnd > 0 && (name[nameEnd-1]==' '||name[nameEnd-1]=='.')) nameEnd--;
             if (nameEnd > 0) cleanName = name.substr(0, nameEnd);
 
             if (!url.empty() || !tid.empty()) {
+                std::lock_guard<std::mutex> lock(g_titleDataMutex);
                 g_titleNames.push_back(cleanName.empty() ? tid : cleanName);
                 g_titleIds.push_back(tid);
                 g_titleUrls.push_back(url);
+                g_titleIconUrls.push_back("");
             }
         }
     }
     g_fetchDone   = true;
-    g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+    {
+        std::lock_guard<std::mutex> lock(g_titleDataMutex);
+        g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
+    }
 }
 
-// ─── Installed titles — navigable 4-wide icon grid ──────────────────────────
-// Each row is a horizontal BoxLayout inside a List.
-// ListItems inside the BoxLayout are focusable; LEFT/RIGHT handled by BoxLayout,
-// UP/DOWN handled by List. Highlights and cursor work normally.
+
+// installed games tab
 void frame_showInstalled() {
     brls::AppletFrame* frame = new brls::AppletFrame(true, true);
     frame->setTitle("Installed Titles");
@@ -1047,20 +1240,20 @@ void frame_showInstalled() {
             }
             if (!name[0]) strncpy(name, tid, sizeof(name)-1);
 
-            // Start a new row every COLS items
+
             if (col == 0) {
                 row = new brls::BoxLayout(brls::BoxLayoutOrientation::HORIZONTAL);
                 row->setHeight(200);
                 row->setSpacing(4);
             }
 
-            // Each cell is a ListItem with a thumbnail — fully focusable
+
             brls::ListItem* cell = new brls::ListItem(name);
             cell->setWidth(280);
             if (iconBuf)
                 cell->setThumbnail(iconBuf, iconSize);
 
-            // A press launches the title
+
             cell->getClickEvent()->subscribe([appId](brls::View*) {
                 accountInitialize(AccountServiceType_Application);
                 AccountUid uid = {};
@@ -1080,7 +1273,7 @@ void frame_showInstalled() {
                 col = 0;
             }
         }
-        // Add last partial row
+
         if (row) list->addView(row);
 
         delete ctrl;
@@ -1091,9 +1284,8 @@ void frame_showInstalled() {
     brls::Application::pushView(frame);
 }
 
-// ─── File browser ─────────────────────────────────────────────────────────────
 
-
+// browse tab
 void frame_showFileBrowser(const std::string& path) {
     brls::AppletFrame* frame = new brls::AppletFrame(true, true);
     frame->setTitle("File Browser");
@@ -1141,18 +1333,19 @@ void frame_showFileBrowser(const std::string& path) {
         std::string fn = fp.substr(fp.rfind('/')+1);
         brls::ListItem* item = new brls::ListItem(fn, fp);
         item->getClickEvent()->subscribe([fn, fp](brls::View*) {
-            // Show confirm dialog
+
             brls::Dialog* dlg = new brls::Dialog("Install to SD card?\n\n" + fn);
             dlg->addButton("SD Card", [dlg, fn, fp](brls::View*) {
                 dlg->close([fn, fp](){
                     inst::ui::instPage::clearInstallCancel();
-                    // Run install on background thread
+
                     struct InstArgs { std::string fp, fn; };
                     auto* args = new InstArgs{fp, fn};
                     thrd_t t;
                     thrd_create(&t, [](void* p) -> int {
+                        BgThreadGuard bgGuard;
                         auto* a = static_cast<InstArgs*>(p);
-                        // Init install services on this thread
+
                         ncmInitialize();
                         nsextInitialize();
                         esInitialize();
@@ -1175,14 +1368,20 @@ void frame_showFileBrowser(const std::string& path) {
                                 task.Begin();
                             }
                             inst::ui::instPage::setInstInfoText("Done: " + a->fn);
-                            // Auto-delete if this was a shop download temp file
+
                             if (a->fp.find("/TheOtherSide/temp/") != std::string::npos)
                                 remove(a->fp.c_str());
-                            brls::Application::notify("Installed: " + a->fn);
+                            {
+                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                g_pendingNotifications.push_back("Installed: " + a->fn);
+                            }
                         } catch (std::exception& e) {
                             std::string err = e.what();
                             inst::ui::instPage::setInstInfoText("Failed: " + err);
-                            brls::Application::notify("Failed: " + err.substr(0, 60));
+                            {
+                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                g_pendingNotifications.push_back("Failed: " + err.substr(0, 60));
+                            }
                         }
                         splExit();
                         splCryptoExit();
@@ -1209,26 +1408,181 @@ void frame_showFileBrowser(const std::string& path) {
     brls::Application::pushView(frame);
 }
 
-// Builds a single shop title ListItem (icon, name, install-on-click).
-// Extracted so both the initial page and "Load more" batches can reuse it
-// without constructing all 45K+ items up front, which is what was causing
-// the scroll freeze (borealis lays out every child eagerly, not lazily).
-static brls::ListItem* buildShopTitleItem(const std::string& name, const std::string& tid, const std::string& url) {
-    // Check if icon exists first so we can decide the row layout
+
+static brls::ListItem* buildShopTitleItem(const std::string& name, const std::string& tid, const std::string& url, const std::string& iconUrl) {
+
     std::string tidUpper = tid;
     for (auto& c : tidUpper) c = toupper(c);
-    std::string iconPath = std::string(ICON_CACHE_DIR) + "/" + tidUpper + ".jpg";
-    bool hasIcon = !tidUpper.empty() && g_iconCacheSet.count(tidUpper) > 0;
+    std::string iconShardDir = tidUpper.empty() ? std::string(ICON_CACHE_DIR) : GetIconShardDir(tidUpper);
+    std::string iconPathJpg = iconShardDir + "/" + tidUpper + ".jpg";
+    std::string iconPathPng = iconShardDir + "/" + tidUpper + ".png";
+    std::string iconPathWebp = iconShardDir + "/" + tidUpper + ".webp";
+    std::string iconPath = iconPathJpg;
+    bool hasIcon;
+    {
 
-    // With icon: taller row (140px) gives bigger icon display.
-    // Without icon: two-line row showing title ID as sublabel.
+
+        std::lock_guard<std::mutex> lock(g_iconCacheSetMutex);
+        auto it = g_iconCacheSet.find(tidUpper);
+        hasIcon = !tidUpper.empty() && it != g_iconCacheSet.end();
+        if (hasIcon) iconPath = iconShardDir + "/" + tidUpper + it->second;
+    }
+
+
+    uint64_t offlineDbTidNum = 0;
+    bool offlineDbPackHas = false;
+    if (!hasIcon && !tidUpper.empty()) {
+        offlineDbTidNum = strtoull(tidUpper.c_str(), nullptr, 16);
+        uint64_t hasIconT0 = armGetSystemTick();
+        offlineDbPackHas = offlineDbTidNum != 0 && inst::offline::HasIcon(offlineDbTidNum);
+        g_hasIconTicksAccum.fetch_add(armGetSystemTick() - hasIconT0, std::memory_order_relaxed);
+    }
+
+
     brls::ListItem* item = hasIcon
         ? new brls::ListItem(name)
         : new brls::ListItem(name, tid);
 
     if (hasIcon) {
-        item->setThumbnail(iconPath);
-        item->setHeight(140); // bigger icon — thumbnail = 140-22 = 118px
+        item->setHeight(140);
+
+
+        uint64_t readT0 = armGetSystemTick();
+        FILE* f = fopen(iconPath.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            if (sz > 0) {
+                fseek(f, 0, SEEK_SET);
+                std::string bytes;
+                bytes.resize((size_t)sz);
+                if (fread(&bytes[0], 1, (size_t)sz, f) == (size_t)sz) {
+                    uint64_t gen = g_shopScreenGeneration.load();
+                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                    g_visibleShopItems[tidUpper].push_back(item);
+                    g_pendingIcons.push_back(PendingIcon{tidUpper, bytes, gen});
+                }
+            }
+            fclose(f);
+        }
+        g_readTicksAccum.fetch_add(armGetSystemTick() - readT0, std::memory_order_relaxed);
+    } else if (!tidUpper.empty()) {
+
+
+        std::string effectiveUrl = iconUrl;
+        std::string effectivePath = iconPathPng;
+        bool useOfflineDbPack = false;
+        if (effectiveUrl.empty() && offlineDbPackHas) {
+            useOfflineDbPack = true;
+        } else if (effectiveUrl.empty()) {
+            loadIconIndexIfNeeded();
+            std::string indexIconUrl;
+            std::lock_guard<std::mutex> lock(g_iconIndexMutex);
+            auto it = g_iconIndex.find(tidUpper);
+            if (it != g_iconIndex.end()) indexIconUrl = it->second;
+            effectiveUrl = indexIconUrl;
+            effectivePath = iconPathJpg;
+        }
+        if (useOfflineDbPack &&
+            g_activeIconFetches.load(std::memory_order_relaxed) < kMaxConcurrentIconFetches) {
+
+
+            g_activeIconFetches.fetch_add(1, std::memory_order_relaxed);
+            uint64_t gen = g_shopScreenGeneration.load();
+            {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_visibleShopItems[tidUpper].push_back(item);
+            }
+            struct OfflineDbFetchArgs { std::string tid, path; uint64_t tidNum; uint64_t gen; };
+            auto* args = new OfflineDbFetchArgs{tidUpper, iconPathWebp, offlineDbTidNum, gen};
+            thrd_t t;
+            thrd_create(&t, [](void* p) -> int {
+                BgThreadGuard bgGuard;
+                struct FetchSlotGuard {
+                    ~FetchSlotGuard() { g_activeIconFetches.fetch_sub(1, std::memory_order_relaxed); }
+                } slotGuard;
+                std::unique_ptr<OfflineDbFetchArgs> a(static_cast<OfflineDbFetchArgs*>(p));
+                if (a->gen != g_shopScreenGeneration.load()) return 0;
+
+                std::vector<uint8_t> imgBytes;
+                if (inst::offline::TryGetIconData(a->tidNum, imgBytes) && !imgBytes.empty()) {
+                    FILE* f = fopen(a->path.c_str(), "wb");
+                    if (f) { fwrite(imgBytes.data(), 1, imgBytes.size(), f); fclose(f); }
+                    {
+                        std::lock_guard<std::mutex> lock(g_iconCacheSetMutex);
+                        g_iconCacheSet[a->tid] = ".webp";
+                    }
+                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                    g_pendingIcons.push_back(PendingIcon{a->tid, std::string(imgBytes.begin(), imgBytes.end()), a->gen});
+                }
+                return 0;
+            }, args);
+            thrd_detach(t);
+        } else if (!effectiveUrl.empty() &&
+            g_activeIconFetches.load(std::memory_order_relaxed) < kMaxConcurrentIconFetches) {
+            g_activeIconFetches.fetch_add(1, std::memory_order_relaxed);
+            uint64_t gen = g_shopScreenGeneration.load();
+            {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_visibleShopItems[tidUpper].push_back(item);
+            }
+            struct IconFetchArgs { std::string tid, url, path; uint64_t gen; };
+            auto* args = new IconFetchArgs{tidUpper, effectiveUrl, effectivePath, gen};
+            thrd_t t;
+            thrd_create(&t, [](void* p) -> int {
+                BgThreadGuard bgGuard;
+                struct FetchSlotGuard {
+                    ~FetchSlotGuard() { g_activeIconFetches.fetch_sub(1, std::memory_order_relaxed); }
+                } slotGuard;
+                std::unique_ptr<IconFetchArgs> a(static_cast<IconFetchArgs*>(p));
+
+
+                if (a->gen != g_shopScreenGeneration.load()) return 0;
+
+                std::string bytes;
+                CURL* curl = curl_easy_init();
+                if (curl) {
+                    curl_easy_setopt(curl, CURLOPT_URL, a->url.c_str());
+                    curl_easy_setopt(curl, CURLOPT_USERAGENT, TINCLONE_UA);
+                    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+                    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+                    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+                    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+                    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_string);
+                    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &bytes);
+
+
+                    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+                        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                            return g_fetchCancel ? 1 : 0;
+                        });
+                    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
+                    CURLcode res = curl_easy_perform(curl);
+                    long httpCode = 0;
+                    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+                    curl_easy_cleanup(curl);
+                    if (res != CURLE_OK || httpCode != 200 || bytes.size() < 100) bytes.clear();
+                }
+
+                if (!bytes.empty()) {
+
+                    FILE* f = fopen(a->path.c_str(), "wb");
+                    if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
+                    {
+                        std::lock_guard<std::mutex> lock(g_iconCacheSetMutex);
+                        size_t dot = a->path.find_last_of('.');
+                        g_iconCacheSet[a->tid] = dot != std::string::npos ? a->path.substr(dot) : ".jpg";
+                    }
+                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                    g_pendingIcons.push_back(PendingIcon{a->tid, bytes, a->gen});
+                }
+                return 0;
+            }, args);
+            thrd_detach(t);
+        }
     }
 
     item->getClickEvent()->subscribe([name, url](brls::View*) {
@@ -1250,6 +1604,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                 auto* args = new NetArgs{u, n, g_shopUser, g_shopPass};
                 thrd_t t;
                 int createResult = thrd_create(&t, [](void* p) -> int {
+                    BgThreadGuard bgGuard;
                     auto* a = static_cast<NetArgs*>(p);
                     if (!a->user.empty())
                         tin::network::SetBasicAuth(a->user, a->pass);
@@ -1271,7 +1626,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                     mkdir(tempDir.c_str(), 0777);
 
                     try {
-                        // Phase 1: Download to temp
+
                         {
                             std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                             g_pendingNotifications.push_back("Downloading " + a->n + "...");
@@ -1299,15 +1654,14 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                             *ctx->total += w * sz;
                             return w * sz;
                         };
-                        static uint64_t s_lastNotify = 0; s_lastNotify = 0;
+                        static int s_lastNotifyPct = -1; s_lastNotifyPct = -1;
                         auto xferFunc = +[](void*, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) -> int {
                             if (dltotal<=0||dlnow<=0) return 0;
-                            uint64_t now=(uint64_t)dlnow;
-                            if (now-s_lastNotify>=10*1024*1024) {
-                                s_lastNotify=now;
-                                double pct=100.0*dlnow/dltotal;
+                            int pct = (int)(100.0*dlnow/dltotal);
+                            if (pct > s_lastNotifyPct) {
+                                s_lastNotifyPct = pct;
                                 double mbNow=dlnow/1048576.0, mbTotal=dltotal/1048576.0;
-                                char msg[64]; snprintf(msg,sizeof(msg),"DL %.0f/%.0f MB (%.0f%%)",mbNow,mbTotal,pct);
+                                char msg[64]; snprintf(msg,sizeof(msg),"DL %.0f/%.0f MB (%d%%)",mbNow,mbTotal,pct);
                                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                                 g_pendingNotifications.push_back(msg);
                             }
@@ -1338,7 +1692,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                         FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt","a");
                         if (dbg2) { fprintf(dbg2,"download complete: %llu bytes\n",(unsigned long long)totalBytes); fclose(dbg2); }
 
-                        // Phase 2: Install from temp using Browse SD Card path
+
                         {
                             std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                             g_pendingNotifications.push_back("Installing...");
@@ -1390,7 +1744,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                     FILE* dbgFail = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
                     if (dbgFail) { fprintf(dbgFail, "install thread creation FAILED, code=%d\n", createResult); fclose(dbgFail); }
                     brls::Application::notify("Install failed to start (thread error)");
-                    delete args; // thread never ran, so it never owns/frees args
+                    delete args;
                 }
             });
         });
@@ -1401,16 +1755,13 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
     return item;
 }
 
-// ─── Shop list ────────────────────────────────────────────────────────────────
-// Lower than the original 300: each item now spawns its own background
-// thread + curl handle for icon fetching. 300 concurrent network threads on
-// Switch's stack is excessive; 60 per page is a more reasonable ceiling
-// while still keeping pagination clicks infrequent.
+
 static const size_t kShopPageSize = 60;
 
-// Forward declaration — defined later in this file
+
 static std::string showKeyboard(const std::string& guide, const std::string& initial, int maxLen);
 
+// shop stuff
 void frame_showShop(const std::string& category, const std::string& typeFilter) {
     g_shopScreenGeneration.fetch_add(1);
     g_visibleShopItems.clear();
@@ -1420,12 +1771,17 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
     frame->setIcon(BOREALIS_ASSET("icon/games.jpg"));
     brls::List* list = new brls::List();
 
+    bool titlesEmpty;
+    {
+        std::lock_guard<std::mutex> lock(g_titleDataMutex);
+        titlesEmpty = g_titleNames.empty();
+    }
     if (!g_fetchDone) {
         list->addView(new brls::ListItem(g_fetchStatus, "Please wait..."));
-    } else if (g_titleNames.empty()) {
+    } else if (titlesEmpty) {
         list->addView(new brls::ListItem("No titles found", "Check " LOCATIONS_PATH));
     } else {
-        // Search header
+
         auto searchTerm = std::make_shared<std::string>("");
         auto currentFilter = std::make_shared<std::string>(typeFilter);
         brls::ListItem* searchBtn = new brls::ListItem("Search", "Press A to search");
@@ -1438,30 +1794,33 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
             std::string filter = *searchTerm;
             for (auto& c : filter) c = tolower(c);
 
-            // Collect matching titles filtered by type
+
             std::vector<size_t> matches;
-            for (size_t i = 0; i < g_titleNames.size(); i++) {
-                const std::string& tid = g_titleIds[i];
-                // Determine type from last 3 hex digits of title ID
-                std::string suffix = tid.size() >= 3 ? tid.substr(tid.size() - 3) : "";
-                for (auto& c : suffix) c = toupper(c);
+            {
+                std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                for (size_t i = 0; i < g_titleNames.size(); i++) {
+                    const std::string& tid = g_titleIds[i];
 
-                bool typeMatch = true;
-                if (*currentFilter == "games")
-                    typeMatch = (suffix == "000");
-                else if (*currentFilter == "updates")
-                    typeMatch = (suffix != "000"); // everything that's not a base game
+                    std::string suffix = tid.size() >= 3 ? tid.substr(tid.size() - 3) : "";
+                    for (auto& c : suffix) c = toupper(c);
 
-                if (!typeMatch) continue;
+                    bool typeMatch = true;
+                    if (*currentFilter == "games")
+                        typeMatch = (suffix == "000");
+                    else if (*currentFilter == "updates")
+                        typeMatch = (suffix != "000");
 
-                if (filter.empty()) {
-                    matches.push_back(i);
-                } else {
-                    std::string nameLower = g_titleNames[i];
-                    for (auto& c : nameLower) c = tolower(c);
-                    if (nameLower.find(filter) != std::string::npos ||
-                        tid.find(*searchTerm) != std::string::npos)
+                    if (!typeMatch) continue;
+
+                    if (filter.empty()) {
                         matches.push_back(i);
+                    } else {
+                        std::string nameLower = g_titleNames[i];
+                        for (auto& c : nameLower) c = tolower(c);
+                        if (nameLower.find(filter) != std::string::npos ||
+                            tid.find(*searchTerm) != std::string::npos)
+                            matches.push_back(i);
+                    }
                 }
             }
 
@@ -1478,12 +1837,47 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
                 size_t start = *loadedCount;
                 size_t end = std::min(start + kShopPageSize, matches.size());
                 bool hadButton = list->getViewsCount() > 1;
-                // Save position of first new item (before adding new items)
+
                 int firstNewItem = (int)list->getViewsCount() - (hadButton ? 1 : 0);
                 if (hadButton)
                     list->removeView((int)list->getViewsCount() - 1, false);
-                for (size_t i = start; i < end; i++)
-                    list->addView(buildShopTitleItem(g_titleNames[matches[i]], g_titleIds[matches[i]], g_titleUrls[matches[i]]));
+                uint64_t pageTickStart = armGetSystemTick();
+                uint64_t buildTicks = 0, addViewTicks = 0;
+                g_hasIconTicksAccum.store(0, std::memory_order_relaxed);
+                g_statTicksAccum.store(0, std::memory_order_relaxed);
+                g_readTicksAccum.store(0, std::memory_order_relaxed);
+                for (size_t i = start; i < end; i++) {
+                    uint64_t t0 = armGetSystemTick();
+                    std::string tName, tId, tUrl, tIconUrl;
+                    {
+                        std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                        tName = g_titleNames[matches[i]];
+                        tId   = g_titleIds[matches[i]];
+                        tUrl  = g_titleUrls[matches[i]];
+                        tIconUrl = matches[i] < g_titleIconUrls.size() ? g_titleIconUrls[matches[i]] : std::string();
+                    }
+                    brls::ListItem* built = buildShopTitleItem(tName, tId, tUrl, tIconUrl);
+                    uint64_t t1 = armGetSystemTick();
+                    list->addView(built);
+                    uint64_t t2 = armGetSystemTick();
+                    buildTicks += (t1 - t0);
+                    addViewTicks += (t2 - t1);
+                }
+                uint64_t pageTickEnd = armGetSystemTick();
+                {
+                    double totalMs = armTicksToNs(pageTickEnd - pageTickStart) / 1000000.0;
+                    double buildMs = armTicksToNs(buildTicks) / 1000000.0;
+                    double addViewMs = armTicksToNs(addViewTicks) / 1000000.0;
+                    double hasIconMs = armTicksToNs(g_hasIconTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
+                    double statMs = armTicksToNs(g_statTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
+                    double readMs = armTicksToNs(g_readTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
+                    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+                    if (dbg) {
+                        fprintf(dbg, "page load: %zu titles, total=%.1fms buildShopTitleItem=%.1fms addView=%.1fms HasIcon=%.1fms stat=%.1fms fileRead=%.1fms\n",
+                                end - start, totalMs, buildMs, addViewMs, hasIconMs, statMs, readMs);
+                        fclose(dbg);
+                    }
+                }
                 *loadedCount = end;
                 if (end < matches.size()) {
                     size_t remaining = matches.size() - end;
@@ -1494,12 +1888,12 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
                     loadMoreBtn->setValue("");
                 }
                 if (hadButton) list->addView(loadMoreBtn);
-                // Scroll to first new item so user sees new content from the top
+
                 int totalItems = (int)list->getViewsCount();
                 if (totalItems > 1 && start > 0) {
                     float targetScroll = (float)firstNewItem / (float)totalItems;
                     list->setScrollY(targetScroll);
-                    
+
                 }
             };
 
@@ -1511,9 +1905,9 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
         list->addView(searchBtn);
         (*buildTitleList)();
 
-        // L/R buttons jump scroll by ~10 items
+
         frame->registerAction("Jump Up", brls::Key::L, [list]() {
-            // Find current focus index and jump up 10
+
             brls::View* focus = brls::Application::currentFocus;
             int count = list->getViewsCount();
             for (int i = 0; i < count; i++) {
@@ -1549,7 +1943,6 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
 }
 
 
-// Show software keyboard and return input string
 static std::string showKeyboard(const std::string& guide, const std::string& initial, int maxLen = 256) {
     SwkbdConfig kbd;
     swkbdCreate(&kbd, 0);
@@ -1564,28 +1957,28 @@ static std::string showKeyboard(const std::string& guide, const std::string& ini
     return initial;
 }
 
-// Add a location entry via field-by-field keyboard input
+
 static void showAddShopDialog(std::function<void()> onDone = nullptr) {
     Location loc;
     loc.protocol = "HTTPS";
     loc.url      = "";
     loc.path     = "";
 
-    // Protocol
-    std::string proto = showKeyboard("Step 1 of 6 - Protocol: type http or https", "https");
+
+    std::string proto = showKeyboard("Step 1 of 7 - Protocol: type http or https", "https");
     for (auto& c : proto) c = toupper(c);
     if (proto == "HTTP" || proto == "HTTPS")
         loc.protocol = proto;
 
-    // Host — starts BLANK so there's nothing to accidentally leave in place.
-    loc.url = sanitizeHostInput(showKeyboard("Step 2 of 6 - Host only, e.g: opennx.github.io", ""));
+
+    loc.url = sanitizeHostInput(showKeyboard("Step 2 of 7 - Host only, e.g: opennx.github.io", ""));
     if (loc.url.empty()) {
         brls::Application::notify("Cancelled - no host entered");
         return;
     }
 
-    // Port — leave blank for standard ports (80 for http, 443 for https)
-    std::string rawPort = showKeyboard("Step 3 of 6 - Port (leave blank for standard 80/443), e.g: 82", "");
+
+    std::string rawPort = showKeyboard("Step 3 of 7 - Port (leave blank for standard 80/443), e.g: 82", "");
     std::string cleanPort;
     for (char c : rawPort) if (c >= '0' && c <= '9') cleanPort += c;
     if (!cleanPort.empty()) {
@@ -1593,39 +1986,45 @@ static void showAddShopDialog(std::function<void()> onDone = nullptr) {
         loc.port = (portNum > 0 && portNum <= 65535) ? cleanPort : "";
     }
 
-    // Path — also starts blank. Leaving it blank is valid (root URL).
-    loc.path = showKeyboard("Step 4 of 6 - Path (leave blank for none), e.g: tinfoil.json", "");
 
-    // Username (optional)
-    loc.username = showKeyboard("Step 5 of 6 - Username (leave blank if none)", "");
+    loc.path = showKeyboard("Step 4 of 7 - Path (leave blank for none), e.g: tinfoil.json", "");
 
-    // Password (optional)
+
+    loc.username = showKeyboard("Step 5 of 7 - Username (leave blank if none)", "");
+
+
     if (!loc.username.empty())
-        loc.password = showKeyboard("Step 5 of 6 - Password", "");
+        loc.password = showKeyboard("Step 5 of 7 - Password", "");
 
-    // Title
-    std::string title = showKeyboard("Step 6 of 6 - Title (display name only)", loc.url);
 
-    // Review before saving — shows exactly what was entered so a mistake
-    // gets caught here instead of silently corrupting locations.conf.
+    std::string title = showKeyboard("Step 6 of 7 - Title (display name only)", loc.url);
+
+
+    std::string fmt = showKeyboard("Step 7 of 7 - Format: type TINFOIL or CYBERFOIL (leave blank for TINFOIL)", "");
+    for (auto& c : fmt) c = toupper(c);
+    loc.format = (fmt == "CYBERFOIL") ? ShopFormat::CyberFoil : ShopFormat::TinfoilLegacy;
+
+
     std::string summary = "Protocol: " + loc.protocol + "\n"
         + "Host: " + loc.url + "\n"
         + "Port: " + (loc.port.empty() ? "(default)" : loc.port) + "\n"
         + "Path: " + (loc.path.empty() ? "(none)" : loc.path) + "\n"
         + "Username: " + (loc.username.empty() ? "(none)" : loc.username) + "\n"
+        + "Format: " + (loc.format == ShopFormat::CyberFoil ? "CyberFoil" : "Tinfoil/Legacy") + "\n"
         + "Title: " + title;
 
-    brls::Dialog* confirmDlg = new brls::Dialog("Add this shop?\n\n" + summary);
+    brls::Dialog* confirmDlg = new brls::Dialog("Add this shop?\n" + summary);
     confirmDlg->addButton("Save", [confirmDlg, loc, title, onDone](brls::View*) {
         confirmDlg->close([loc, title, onDone]() {
             auto locs = loadLocations();
             locs.push_back(loc);
             saveLocations(locs);
 
-            g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear();
+            { std::lock_guard<std::mutex> lock(g_titleDataMutex);
+              g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); }
             g_fetchDone = false; g_fetchCancel = false;
             thrd_t ft;
-            thrd_create(&ft, [](void*)->int{ doFetch(); return 0; }, nullptr);
+            thrd_create(&ft, [](void*)->int{ BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
             thrd_detach(ft);
 
             brls::Application::notify("Shop added! Fetching " + title + "...");
@@ -1639,28 +2038,72 @@ static void showAddShopDialog(std::function<void()> onDone = nullptr) {
     confirmDlg->open();
 }
 
-// ─── Options ──────────────────────────────────────────────────────────────────
-void frame_showOptions() {
-    brls::AppletFrame* frame = new brls::AppletFrame(true, true);
-    frame->setTitle("Options");
-    frame->setIcon(BOREALIS_ASSET("icon/options.jpg"));
-    brls::List* list = new brls::List();
 
+// options
+void populateOptionsList(brls::List* list) {
     list->addView(new brls::ListItem("User-Agent", TINCLONE_UA));
 
-    // Add shop button
 
-    // Add custom shop via keyboard — uses the full multi-step dialog
-    // (Protocol, Host, Path, optional auth) rather than a single combined
-    // URL field, so shops requiring a Path (e.g. "tinfoil.json") can
-    // actually be added correctly.
     brls::ListItem* addCustom = new brls::ListItem("+ Add custom shop URL", "Press A to enter Protocol/Host/Path");
     addCustom->getClickEvent()->subscribe([](brls::View*) {
         showAddShopDialog();
     });
     list->addView(addCustom);
 
-    // MTP Install toggle
+
+    brls::ListItem* buildIdx = new brls::ListItem("Build icon index", "Downloads ~80MB once, enables icons for new titles");
+    buildIdx->getClickEvent()->subscribe([](brls::View*) {
+
+
+        bool expected = false;
+        if (!g_iconIndexBuildInProgress.compare_exchange_strong(expected, true)) {
+            brls::Application::notify("Icon index build already in progress...");
+            return;
+        }
+        brls::Application::notify("Building icon index...");
+        thrd_t t;
+        thrd_create(&t, [](void*) -> int {
+            BgThreadGuard bgGuard;
+            bool ok = buildIconIndex();
+            g_iconIndexBuildInProgress.store(false);
+            std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+            g_pendingNotifications.push_back(ok ? "Icon index built!" : "Icon index build failed");
+            return 0;
+        }, nullptr);
+        thrd_detach(t);
+    });
+    list->addView(buildIdx);
+
+
+    brls::ListItem* migrateIcons = new brls::ListItem("Migrate icon cache to subfolders",
+        "One-time fix for existing icon_cache/ — spreads icons across subfolders");
+    migrateIcons->getClickEvent()->subscribe([](brls::View*) {
+        bool expected = false;
+        if (!g_iconCacheMigrationInProgress.compare_exchange_strong(expected, true)) {
+            brls::Application::notify("Icon cache migration already in progress...");
+            return;
+        }
+        brls::Application::notify("Migrating icon cache...");
+        thrd_t t;
+        thrd_create(&t, [](void*) -> int {
+            BgThreadGuard bgGuard;
+            int moved = migrateIconCacheToShards([](int done, int total) {
+                int pct = total > 0 ? (done * 100 / total) : 0;
+                char msg[48]; snprintf(msg, sizeof(msg), "Migrating icons: %d%%", pct);
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back(msg);
+            });
+            g_iconCacheMigrationInProgress.store(false);
+            char msg[64]; snprintf(msg, sizeof(msg), "Migrated %d icons into subfolders!", moved);
+            std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+            g_pendingNotifications.push_back(msg);
+            return 0;
+        }, nullptr);
+        thrd_detach(t);
+    });
+    list->addView(migrateIcons);
+
+
     brls::ListItem* mtpItem = new brls::ListItem("MTP Install Mode", inst::mtp::IsInstallServerRunning() ? "Running - connect via USB" : "Press A to start");
     mtpItem->getClickEvent()->subscribe([mtpItem](brls::View*) {
         if (inst::mtp::IsInstallServerRunning()) {
@@ -1669,6 +2112,7 @@ void frame_showOptions() {
         } else {
             thrd_t t;
             thrd_create(&t, [](void*) -> int {
+                BgThreadGuard bgGuard;
                 inst::mtp::StartInstallServer(0);
                 return 0;
             }, nullptr);
@@ -1678,67 +2122,46 @@ void frame_showOptions() {
     });
     list->addView(mtpItem);
 
-    // Check for updates
-    brls::ListItem* updateItem = new brls::ListItem("Check for Updates", "Current version: " APP_VERSION);
+
+    brls::ListItem* updateItem = new brls::ListItem("Check for Updates", "Current version: " + inst::config::appVersion);
     updateItem->getClickEvent()->subscribe([](brls::View*) {
         brls::Application::notify("Checking for updates...");
         thrd_t t;
         thrd_create(&t, [](void*) -> int {
-            // Query GitHub releases API
-            CURL* curl = curl_easy_init();
-            if (!curl) {
-                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                g_pendingNotifications.push_back("Update check failed");
-                return 0;
-            }
-            std::string response;
-            curl_easy_setopt(curl, CURLOPT_URL, "https://api.github.com/repos/eradicatinglove/The-Other-Side/releases/latest");
-            curl_easy_setopt(curl, CURLOPT_USERAGENT, "TheOtherSide/" APP_VERSION);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_string);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-            CURLcode res = curl_easy_perform(curl);
-            curl_easy_cleanup(curl);
+            BgThreadGuard bgGuard;
+            FILE* dbgStart = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+            if (dbgStart) { fprintf(dbgStart, "update thread started\n"); fclose(dbgStart); }
 
-            if (res != CURLE_OK || response.empty()) {
+
+            std::string response = httpGet(
+                "https://raw.githubusercontent.com/eradicatinglove/The-Other-Side/main/version.txt");
+
+            FILE* dbgStart2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+            if (dbgStart2) { fprintf(dbgStart2, "update response: size=%zu data='%.50s'\n", response.size(), response.c_str()); fclose(dbgStart2); }
+
+            if (response.empty()) {
                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                 g_pendingNotifications.push_back("Update check failed: no connection");
                 return 0;
             }
 
-            // Extract tag_name from JSON response
-            std::string tag;
-            size_t p = response.find("\"tag_name\"");
-            if (p != std::string::npos) {
-                size_t q1 = response.find('"', p + 10);
-                size_t q2 = response.find('"', q1 + 1);
-                if (q1 != std::string::npos && q2 != std::string::npos)
-                    tag = response.substr(q1 + 1, q2 - q1 - 1);
-            }
 
-            if (tag.empty()) {
-                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                g_pendingNotifications.push_back("No releases found on GitHub");
-                return 0;
-            }
+            while (!response.empty() && (response.back()=='\n'||response.back()=='\r'||response.back()==' '))
+                response.pop_back();
 
-            // Strip leading 'v' for comparison
-            std::string remoteVer = tag;
+            std::string remoteVer = response;
+
             if (!remoteVer.empty() && remoteVer[0] == 'v') remoteVer = remoteVer.substr(1);
-            std::string currentVer = APP_VERSION;
+            std::string currentVer = inst::config::appVersion;
+            std::string tag = "v" + remoteVer;
 
-            FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbg) { fprintf(dbg, "update check: current=%s remote=%s\n", currentVer.c_str(), remoteVer.c_str()); fclose(dbg); }
+            FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+            if (dbg2) { fprintf(dbg2, "update: current=%s remote=%s\n", currentVer.c_str(), remoteVer.c_str()); fclose(dbg2); }
 
             if (remoteVer == currentVer) {
                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                 g_pendingNotifications.push_back("Already up to date (v" + currentVer + ")");
             } else {
-                // Store update info for dialog on UI thread
                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                 g_pendingNotifications.push_back("UPDATE:" + tag + ":" + remoteVer);
             }
@@ -1749,9 +2172,12 @@ void frame_showOptions() {
     list->addView(updateItem);
     brls::ListItem* refresh = new brls::ListItem("Refresh Shop", "Re-fetch titles from all shops");
     refresh->getClickEvent()->subscribe([](brls::View*) {
-        g_titleNames.clear();
-        g_titleIds.clear();
-        g_titleUrls.clear();
+        {
+            std::lock_guard<std::mutex> lock(g_titleDataMutex);
+            g_titleNames.clear(); g_titleIconUrls.clear();
+            g_titleIds.clear();
+            g_titleUrls.clear();
+        }
         g_fetchDone   = false;
         g_fetchCancel = false;
         doFetch();
@@ -1759,25 +2185,6 @@ void frame_showOptions() {
     });
     list->addView(refresh);
 
-    // Builds the local icon index from blawar's titledb (~82MB download,
-    // Icon cache info
-    brls::ListItem* iconInfo = new brls::ListItem("Icon Cache", "sdmc:/switch/TheOtherSide/icon_cache/");
-    iconInfo->getClickEvent()->subscribe([](brls::View*) {
-        // Count icons in cache
-        DIR* d = opendir("sdmc:/switch/TheOtherSide/icon_cache/");
-        int count = 0;
-        if (d) {
-            struct dirent* e;
-            while ((e = readdir(d)) != nullptr)
-                if (strstr(e->d_name, ".jpg")) count++;
-            closedir(d);
-        }
-        brls::Application::notify("Icon cache: " + std::to_string(count) + " icons");
-    });
-    list->addView(iconInfo);
-
-
-    // Show configured locations
     list->addView(new brls::ListItem("── Configured Shops ──", LOCATIONS_PATH));
     auto locs = loadLocations();
     if (locs.empty()) {
@@ -1798,6 +2205,15 @@ void frame_showOptions() {
                             if (idx < ls2.size()) {
                                 ls2.erase(ls2.begin() + idx);
                                 saveLocations(ls2);
+
+
+                                { std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                                  g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); }
+                                g_fetchDone = false; g_fetchCancel = false;
+                                thrd_t ft;
+                                thrd_create(&ft, [](void*)->int{ BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
+                                thrd_detach(ft);
+
                                 brls::Application::notify("Shop removed");
                             }
                         });
@@ -1810,25 +2226,45 @@ void frame_showOptions() {
             list->addView(item);
         }
     }
+}
 
+
+void frame_showOptions() {
+    brls::AppletFrame* frame = new brls::AppletFrame(true, true);
+    frame->setTitle("Options");
+    frame->setIcon(BOREALIS_ASSET("icon/options.jpg"));
+    brls::List* list = new brls::List();
+    populateOptionsList(list);
     frame->setContentView(list);
     brls::Application::pushView(frame);
 }
 
-// ─── main — IDENTICAL structure to IconGrabber ────────────────────────────────
+
+// main app
 int main(int argc, char* argv[])
 {
+
+
+    if (std::filesystem::exists("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro")) {
+        bool hasNextLoad = envHasNextLoad();
+        Result rc = envSetNextLoad("sdmc:/switch/TheOtherSide/updater.nro",
+                                    "sdmc:/switch/TheOtherSide/updater.nro");
+        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+        if (dbg) {
+            fprintf(dbg, "cold-start update handoff: envHasNextLoad=%s envSetNextLoad=0x%x (%s)\n",
+                    hasNextLoad ? "true" : "false", rc, R_SUCCEEDED(rc) ? "SUCCEEDED" : "FAILED");
+            fclose(dbg);
+        }
+        return 0;
+    }
+
     nsInitialize();
-    ncmInitialize();
     nifmInitialize(NifmServiceType_User);
-    esInitialize();
     spsmInitialize();
     curl_global_init(CURL_GLOBAL_ALL);
 
-    // Init mainApp stub for CyberFoil install engine
+
     inst::ui::mainApp = new inst::ui::MainApplication();
-    splInitialize();
-    splCryptoInitialize();
 
     brls::Logger::setLogLevel(brls::LogLevel::DEBUG);
     i18n::loadTranslations();
@@ -1842,23 +2278,23 @@ int main(int argc, char* argv[])
     rootFrame->setTitle("main/name"_i18n);
     rootFrame->setIcon(BOREALIS_ASSET("icon/joycons.jpg"));
 
-    // Build tab lists — same as IconGrabber builds settingsTab, searchTab etc
+
     brls::List* installedTab  = new brls::List();
     brls::Label* installedStatusLabel = nullptr;
     brls::List* fileBrowserTab = new brls::List();
     brls::List* shopTab       = new brls::List();
     brls::List* optionsTab    = new brls::List();
 
-    // ── Populate installed tab directly with the icon grid ──────────────────
+
     {
-        // Status bar — built here, pinned outside the scrolling List by
-        // wrapping installedTab in a PinnedStatusView below.
+
+
         installedStatusLabel = new brls::Label(brls::LabelStyle::DESCRIPTION, "", false);
         installedStatusLabel->setHorizontalAlign(NVG_ALIGN_CENTER);
 
         std::string statusText;
 
-        // SD card free / total space
+
         struct statvfs st;
         if (statvfs("sdmc:/", &st) == 0) {
             double freeGB  = (double)(st.f_bavail * st.f_frsize) / (1024.0*1024.0*1024.0);
@@ -1872,7 +2308,7 @@ int main(int argc, char* argv[])
 
         statusText += "   |   ";
 
-        // Internet connection status
+
         NifmInternetConnectionType connType;
         u32 wifiStrength;
         NifmInternetConnectionStatus connStatus;
@@ -1929,7 +2365,7 @@ int main(int argc, char* argv[])
                     row->setSpacing(6);
                 }
 
-                // Icon-only cell — back to the layout you approved.
+
                 brls::ListItem* cell = new brls::ListItem("");
                 cell->setWidth(148);
                 if (iconBuf)
@@ -1971,9 +2407,8 @@ int main(int argc, char* argv[])
     openUpdates->getClickEvent()->subscribe([](brls::View*) { frame_showShop("Updates & DLC", "updates"); });
     shopTab->addView(openUpdates);
 
-    brls::ListItem* openOptions = new brls::ListItem("View Options");
-    openOptions->getClickEvent()->subscribe([](brls::View*) { frame_showOptions(); });
-    optionsTab->addView(openOptions);
+
+    populateOptionsList(optionsTab);
 
     inst::ui::PinnedStatusView* installedPinned = new inst::ui::PinnedStatusView(installedStatusLabel, installedTab);
     rootFrame->addTab("Installed",    installedPinned);
@@ -1986,31 +2421,46 @@ int main(int argc, char* argv[])
     brls::Application::pushView(rootFrame);
 
 
-
-    // Fetch in background using C11 threads (same as CyberFoil install uses)
     g_fetchDone   = false;
     g_fetchCancel = false;
     loadIconCacheSet();
+    ensureIconApplyTaskRunning();
     thrd_t fetchThrd;
-    thrd_create(&fetchThrd, [](void*) -> int { doFetch(); return 0; }, nullptr);
-    thrd_detach(fetchThrd);
+    thrd_create(&fetchThrd, [](void*) -> int { BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
 
-    while (brls::Application::mainLoop())
-        ;
 
-    // Signal background threads to stop and give them a moment to wind down
-    // before destroying curl/services they may still be using.
+    while (brls::Application::mainLoop()) {
+        if (g_deferredQuitRequested.load(std::memory_order_acquire))
+            brls::Application::quit();
+    }
+
+
     g_fetchCancel = true;
-    svcSleepThread(200000000ULL); // 200ms
+    g_iconApplyTaskStopped = true;
+
+
+    if (inst::mtp::IsInstallServerRunning())
+        inst::mtp::StopInstallServer();
+
+
+    thrd_join(fetchThrd, nullptr);
+
+
+    while (g_activeBgThreads.load(std::memory_order_relaxed) > 0)
+        svcSleepThread(50'000'000ULL);
+
+
+    g_titleNames.clear(); g_titleNames.shrink_to_fit();
+    g_titleIconUrls.clear(); g_titleIconUrls.shrink_to_fit();
+    g_titleIds.clear();   g_titleIds.shrink_to_fit();
+    g_titleUrls.clear();  g_titleUrls.shrink_to_fit();
+    g_iconCacheSet.clear();
+    g_iconIndex.clear();
 
     curl_global_cleanup();
-    esExit();
-    nifmExit();
-    ncmExit();
     spsmExit();
     nsExit();
-    splCryptoExit();
-    splExit();
-    delete inst::ui::mainApp;
+
+
     return EXIT_SUCCESS;
 }
