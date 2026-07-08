@@ -444,8 +444,84 @@ public:
                 g_pendingInstallName.clear();
             }
         }
-        for (auto& msg : notifications)
-            brls::Application::notify(msg);
+        for (auto& msg : notifications) {
+            if (msg.substr(0, 7) == "UPDATE:") {
+                // Format: UPDATE:v1.0.1:1.0.1
+                size_t c1 = msg.find(':', 7);
+                std::string tag = msg.substr(7, c1 - 7);
+                std::string ver = msg.substr(c1 + 1);
+                brls::Dialog* dlg = new brls::Dialog("Update available!\n\n" + tag + " is available.\nYou have v" APP_VERSION ".\n\nUpdate now?");
+                dlg->addButton("Update", [dlg, tag](brls::View*) {
+                    dlg->close([tag]() {
+                        // Download new NRO
+                        brls::Application::notify("Downloading update...");
+                        thrd_t t;
+                        thrd_create(&t, [](void* p) -> int {
+                            std::string* ptag = static_cast<std::string*>(p);
+                            std::string dlUrl = "https://github.com/eradicatinglove/The-Other-Side/releases/download/" + *ptag + "/TheOtherSide.nro";
+                            delete ptag;
+
+                            CURL* curl = curl_easy_init();
+                            if (!curl) {
+                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                g_pendingNotifications.push_back("Update download failed");
+                                return 0;
+                            }
+                            FILE* f = fopen("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro", "wb");
+                            if (!f) { curl_easy_cleanup(curl); return 0; }
+
+                            static uint64_t s_upd_last = 0; s_upd_last = 0;
+                            auto xferFunc = +[](void*, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) -> int {
+                                if (dltotal <= 0 || dlnow <= 0) return 0;
+                                uint64_t now = (uint64_t)dlnow;
+                                if (now - s_upd_last >= 1024*1024) {
+                                    s_upd_last = now;
+                                    double pct = 100.0*dlnow/dltotal;
+                                    char msg2[48]; snprintf(msg2, sizeof(msg2), "Update: %.0f%%", pct);
+                                    std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                    g_pendingNotifications.push_back(msg2);
+                                }
+                                return 0;
+                            };
+
+                            curl_easy_setopt(curl, CURLOPT_URL, dlUrl.c_str());
+                            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+                            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                            curl_easy_setopt(curl, CURLOPT_USERAGENT, "TheOtherSide/" APP_VERSION);
+                            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_file);
+                            curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+                            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferFunc);
+                            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
+                            CURLcode res = curl_easy_perform(curl);
+                            curl_easy_cleanup(curl);
+                            fclose(f);
+
+                            if (res == CURLE_OK) {
+                                // Replace current NRO
+                                remove("sdmc:/switch/TheOtherSide/TheOtherSide.nro");
+                                rename("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro",
+                                       "sdmc:/switch/TheOtherSide/TheOtherSide.nro");
+                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                g_pendingNotifications.push_back("Update installed! Restart the app.");
+                            } else {
+                                remove("sdmc:/switch/TheOtherSide/TheOtherSide_update.nro");
+                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                                g_pendingNotifications.push_back("Update download failed");
+                            }
+                            return 0;
+                        }, new std::string(tag));
+                        thrd_detach(t);
+                    });
+                });
+                dlg->addButton("Not now", [dlg](brls::View*) { dlg->close([](){}); });
+                dlg->setCancelable(false);
+                dlg->open();
+            } else {
+                brls::Application::notify(msg);
+            }
+        }
 
         if (!installPath.empty()) {
             brls::Dialog* instDlg = new brls::Dialog("Download complete!\n\nInstall " + installName + " now?");
@@ -1602,7 +1678,75 @@ void frame_showOptions() {
     });
     list->addView(mtpItem);
 
-    // Refresh shop button
+    // Check for updates
+    brls::ListItem* updateItem = new brls::ListItem("Check for Updates", "Current version: " APP_VERSION);
+    updateItem->getClickEvent()->subscribe([](brls::View*) {
+        brls::Application::notify("Checking for updates...");
+        thrd_t t;
+        thrd_create(&t, [](void*) -> int {
+            // Query GitHub releases API
+            CURL* curl = curl_easy_init();
+            if (!curl) {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back("Update check failed");
+                return 0;
+            }
+            std::string response;
+            curl_easy_setopt(curl, CURLOPT_URL, "https://api.github.com/repos/eradicatinglove/The-Other-Side/releases/latest");
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, "TheOtherSide/" APP_VERSION);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_string);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            CURLcode res = curl_easy_perform(curl);
+            curl_easy_cleanup(curl);
+
+            if (res != CURLE_OK || response.empty()) {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back("Update check failed: no connection");
+                return 0;
+            }
+
+            // Extract tag_name from JSON response
+            std::string tag;
+            size_t p = response.find("\"tag_name\"");
+            if (p != std::string::npos) {
+                size_t q1 = response.find('"', p + 10);
+                size_t q2 = response.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos)
+                    tag = response.substr(q1 + 1, q2 - q1 - 1);
+            }
+
+            if (tag.empty()) {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back("No releases found on GitHub");
+                return 0;
+            }
+
+            // Strip leading 'v' for comparison
+            std::string remoteVer = tag;
+            if (!remoteVer.empty() && remoteVer[0] == 'v') remoteVer = remoteVer.substr(1);
+            std::string currentVer = APP_VERSION;
+
+            FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
+            if (dbg) { fprintf(dbg, "update check: current=%s remote=%s\n", currentVer.c_str(), remoteVer.c_str()); fclose(dbg); }
+
+            if (remoteVer == currentVer) {
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back("Already up to date (v" + currentVer + ")");
+            } else {
+                // Store update info for dialog on UI thread
+                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
+                g_pendingNotifications.push_back("UPDATE:" + tag + ":" + remoteVer);
+            }
+            return 0;
+        }, nullptr);
+        thrd_detach(t);
+    });
+    list->addView(updateItem);
     brls::ListItem* refresh = new brls::ListItem("Refresh Shop", "Re-fetch titles from all shops");
     refresh->getClickEvent()->subscribe([](brls::View*) {
         g_titleNames.clear();
