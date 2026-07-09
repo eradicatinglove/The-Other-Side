@@ -1625,6 +1625,12 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                     const std::string tempPath = tempDir + "/" + safeId + ext;
                     mkdir(tempDir.c_str(), 0777);
 
+                    // keep the console awake for the whole download+install, not just the install part
+                    struct AwakeGuard {
+                        AwakeGuard()  { appletSetMediaPlaybackState(true); }
+                        ~AwakeGuard() { appletSetMediaPlaybackState(false); }
+                    } awakeGuard;
+
                     try {
 
                         {
