@@ -84,12 +84,8 @@ namespace tin::install::nsp
         const PFS0FileEntry* fileEntry = m_NSP->GetFileEntryByNcaId(ncaId);
 
         if (fileEntry == nullptr) {
-            FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbg) {
-                fprintf(dbg, "InstallNCA: NCA ID %s not found in PFS0 - skipping\n",
+            DBG_LOG("InstallNCA: NCA ID %s not found in PFS0 - skipping\n",
                     tin::util::GetNcaIdString(ncaId).c_str());
-                fclose(dbg);
-            }
             return; // skip missing NCAs rather than crashing
         }
 

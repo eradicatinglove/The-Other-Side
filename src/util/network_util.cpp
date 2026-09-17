@@ -173,6 +173,7 @@ namespace tin::network
     {
         std::function<size_t (u8* bytes, size_t size)>* streamFunc = nullptr;
         bool hadException = false;
+        u64 lastDataTick = 0;
     };
 
     static size_t ParseHTMLDataCallback(char* bytes, size_t size, size_t numItems, void* userData)
@@ -183,6 +184,8 @@ namespace tin::network
 
         if (inst::ui::instPage::isInstallCancelRequested())
             return 0;
+
+        ctx->lastDataTick = armGetSystemTick();
 
         const size_t numBytes = size * numItems;
         try {
@@ -195,16 +198,40 @@ namespace tin::network
         }
     }
 
+    // Curl's write callback only fires once bytes actually arrive, so it can't
+    // detect a connection that the server accepted but then sent nothing on.
+    // LOW_SPEED_LIMIT/LOW_SPEED_TIME are set below as a first line of defense,
+    // but aren't reliably enforced on every platform/backend, so this progress
+    // callback is a second, self-contained idle-timeout: it fires periodically
+    // regardless of whether any data has flowed, and aborts the transfer if
+    // nothing has arrived for too long.
+    static int StreamProgressCallback(void* userData, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+    {
+        auto* ctx = reinterpret_cast<StreamCallbackContext*>(userData);
+        if (!ctx)
+            return 0;
+
+        if (inst::ui::instPage::isInstallCancelRequested())
+            return 1;
+
+        static constexpr u64 kIdleTimeoutSeconds = 20;
+        const u64 now = armGetSystemTick();
+        const u64 freq = armGetSystemTickFreq();
+        if (ctx->lastDataTick != 0 && (now - ctx->lastDataTick) >= freq * kIdleTimeoutSeconds)
+            return 1; // non-zero return aborts curl_easy_perform with CURLE_ABORTED_BY_CALLBACK
+
+        return 0;
+    }
+
     static int StreamHttpRangeForUrl(const std::string& url, size_t offset, size_t size,
         const std::function<size_t (u8* bytes, size_t size)>& streamFunc)
     {
         if (size == 0)
             return 0;
 
-        // Embed credentials in the URL like Tinfoil does
-        // (https://user:pass@host:port/path) in addition to the Basic Auth
-        // header — some servers (like jfmodzone) may handle URL-embedded
-        // credentials differently from the Authorization header.
+        // embed creds in the url too (user:pass@host), same as Tinfoil -
+        // some servers like jfmodzone don't seem to handle the Basic Auth
+        // header the same way
         std::string requestUrl = TrimCopy(StripUrlFragment(url));
         if (g_basic_auth_set && !g_basic_auth_user.empty()) {
             // Insert user:pass@ after the scheme
@@ -218,6 +245,7 @@ namespace tin::network
         auto writeDataFunc = streamFunc;
         StreamCallbackContext callbackCtx;
         callbackCtx.streamFunc = &writeDataFunc;
+        callbackCtx.lastDataTick = armGetSystemTick();
         CURL* curl = curl_easy_init();
         if (!curl)
             THROW_FORMAT("Failed to initialize curl\n");
@@ -243,6 +271,9 @@ namespace tin::network
         curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &callbackCtx);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &ParseHTMLDataCallback);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &StreamProgressCallback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &callbackCtx);
         std::string authValue;
         ApplyBasicAuth(curl, authValue);
 
@@ -277,13 +308,9 @@ namespace tin::network
             curl_slist_free_all(headerList);
         curl_easy_cleanup(curl);
 
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) {
-            fprintf(dbg, "StreamHttpRange: url=%s range=%s rc=%d (%s) http=%lu\n",
+        DBG_LOG("StreamHttpRange: url=%s range=%s rc=%d (%s) http=%lu\n",
                 requestUrl.c_str(), range.c_str(), (int)rc,
                 curl_easy_strerror(rc), httpCode);
-            fclose(dbg);
-        }
 
         if (callbackCtx.hadException)
             return 1999;
@@ -385,8 +412,7 @@ namespace tin::network
         m_url(url), m_header(url)
     {
         m_url = TrimCopy(m_url);
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) { fprintf(dbg, "HTTPDownload: initialized for %s\n", m_url.c_str()); fclose(dbg); }
+        DBG_LOG("HTTPDownload: initialized for %s\n", m_url.c_str());
         const bool isJbod = StartsWithNoCase(m_url, "jbod:");
         if (isJbod) {
             m_isJbod = true;

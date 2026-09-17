@@ -12,13 +12,17 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	TheOtherSide
 BUILD		:=	build.nx
-SOURCES		:=	src src/install src/data src/nx src/nx/ipc src/util_needed src/ui external/libhaze/source
+SOURCES		:=	src src/install src/data src/nx src/nx/ipc src/util_needed src/ui external/libhaze/source \
+				external/libusbhsfs/source external/libusbhsfs/source/fatfs \
+				external/libusbhsfs/source/ntfs-3g external/libusbhsfs/source/lwext4 \
+				external/libusbhsfs/source/sxos
 DATA		:=	data
 ICON		:=	icon.jpg
-INCLUDES	:=	src src/include library/include external/libhaze/include
+INCLUDES	:=	src src/include library/include external/libhaze/include \
+				external/libusbhsfs/include external/libusbhsfs/source
 APP_TITLE	:=	TheOtherSide
 APP_AUTHOR	:=	eradicatinglove
-APP_VERSION	:=	2.0.0
+APP_VERSION	:=	3.0.4
 
 # Borealis resources go into the RomFS
 ROMFS				:=	resources
@@ -34,10 +38,16 @@ ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
-CFLAGS	+=	$(INCLUDE) -D__SWITCH__ \
-			-DBOREALIS_RESOURCES="\"$(BOREALIS_RESOURCES)\""
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -DGPL_BUILD \
+			-DBOREALIS_RESOURCES=\"$(BOREALIS_RESOURCES)\"
 
 CFLAGS	+=	-DAPP_VERSION_STR=\"$(APP_VERSION)\"
+
+# make DEBUG=1 for a debug build (writes debug.txt / tinfoil_debug.log),
+# plain make for release (no debug file logging at all)
+ifeq ($(DEBUG),1)
+CFLAGS	+=	-DAPP_DEBUG_LOG
+endif
 
 CXXFLAGS	:= $(CFLAGS) -std=gnu++20 -fexceptions -Wno-reorder
 
@@ -45,7 +55,7 @@ ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 
-LIBS	:=  -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lz -lwebp -lnx -lm
+LIBS	:=  -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lz -lwebp -lnx -lm -lntfs-3g -llwext4
 
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)

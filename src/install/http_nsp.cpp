@@ -126,8 +126,8 @@ namespace tin::install::nsp
                 return streamBufSize;
             };
 
-            // Limit total retry cycles to 3 — after that, fail the install
-            // rather than looping forever on a persistently failing connection.
+            // give up after 3 retry cycles instead of looping forever on a
+            // connection that's never going to recover
             int retryCyclesLeft = 3;
             auto retryConfirmFunc = [&]() -> bool {
                 if (retryCyclesLeft <= 0) return false; // give up
@@ -195,6 +195,12 @@ namespace tin::install::nsp
         size_t startSizeBuffered = 0;
         double emaSpeed = 0.0;
 
+        // if buffered bytes stop moving for this long, peer went quiet - bail
+        // instead of spinning at 0% forever
+        static constexpr u64 kStallTimeoutSeconds = 60;
+        u64 lastProgressTime = armGetSystemTick();
+        size_t lastProgressBytes = 0;
+
         inst::ui::instPage::setInstBarPerc(0);
         while (!bufferedPlaceholderWriter.IsBufferDataComplete() && !stopThreadsHttpNsp)
         {
@@ -214,8 +220,25 @@ namespace tin::install::nsp
                     true);
                 args.retryConfirm.approved.store(choice == 0);
                 args.retryConfirm.pending.store(false);
+                // user interacted, don't count the wait as a stall
+                lastProgressTime = armGetSystemTick();
             }
             u64 newTime = armGetSystemTick();
+
+            // watchdog check, separate from the 0.5s speed sampling below
+            {
+                size_t nowBytes = bufferedPlaceholderWriter.GetSizeBuffered();
+                if (nowBytes != lastProgressBytes) {
+                    lastProgressBytes = nowBytes;
+                    lastProgressTime = newTime;
+                } else if (!args.retryConfirm.pending.load() &&
+                           (newTime - lastProgressTime) >= freq * kStallTimeoutSeconds) {
+                    DBG_LOG("stream stalled: no data for %llus, aborting\n",
+                        (unsigned long long)kStallTimeoutSeconds);
+                    stopThreadsHttpNsp = true;
+                    break;
+                }
+            }
 
             if (newTime - startTime >= freq * 0.5)
             {
@@ -247,13 +270,15 @@ namespace tin::install::nsp
                 }
 
                 inst::ui::instPage::setInstInfoText("inst.info_page.downloading"_lang + inst::util::formatUrlString(displayFileName) + "inst.info_page.at"_lang + FormatOneDecimal(emaSpeed) + " MB/s");
-                inst::ui::instPage::setInstBarPerc((double)downloadProgress);
                 inst::ui::instPage::setProgressDetailText(
                     "Downloaded " + FormatOneDecimal(sizeBuffered / (1024 * 1024)) + " / " +
                     FormatOneDecimal(totalSize / (1024 * 1024)) + " MB (" +
                     std::to_string(downloadProgress) + "%) • ETA " + etaText
                 );
+                inst::ui::instPage::setInstBarPerc((double)downloadProgress);
             }
+
+            svcSleepThread(20 * 1000 * 1000ULL); // 20ms: don't spin a core at 100%
         }
         inst::ui::instPage::setInstBarPerc(100);
         inst::ui::instPage::setProgressDetailText("Downloaded 100% • Verifying and installing...");
@@ -270,12 +295,12 @@ namespace tin::install::nsp
             }
             int installProgress = (int)(((double)bufferedPlaceholderWriter.GetSizeWrittenToPlaceholder() / (double)bufferedPlaceholderWriter.GetTotalDataSize()) * 100.0);
 
-            inst::ui::instPage::setInstBarPerc((double)installProgress);
             inst::ui::instPage::setProgressDetailText(
                 "Installing " + FormatOneDecimal((double)bufferedPlaceholderWriter.GetSizeWrittenToPlaceholder() / 1000000.0) + " / " +
                 FormatOneDecimal((double)bufferedPlaceholderWriter.GetTotalDataSize() / 1000000.0) + " MB (" +
                 std::to_string(installProgress) + "%)"
             );
+            inst::ui::instPage::setInstBarPerc((double)installProgress);
         }
         inst::ui::instPage::setInstBarPerc(100);
         inst::ui::instPage::setProgressDetailText("Installing 100%");

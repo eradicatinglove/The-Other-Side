@@ -36,24 +36,21 @@ namespace tin::install::nsp
     void NSP::RetrieveHeader()
     {
         LOG_DEBUG("Retrieving remote NSP header...\n");
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) { fprintf(dbg, "RetrieveHeader: starting\n"); fclose(dbg); }
+        DBG_LOG("RetrieveHeader: starting\n");
 
         // Retrieve the base header
         m_headerBytes.resize(sizeof(PFS0BaseHeader), 0);
         this->BufferData(m_headerBytes.data(), 0x0, sizeof(PFS0BaseHeader));
 
-        FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg2) { fprintf(dbg2, "RetrieveHeader: numFiles=%u stringTableSize=%u\n",
-            this->GetBaseHeader()->numFiles, this->GetBaseHeader()->stringTableSize); fclose(dbg2); }
+        DBG_LOG("RetrieveHeader: numFiles=%u stringTableSize=%u\n",
+            this->GetBaseHeader()->numFiles, this->GetBaseHeader()->stringTableSize);
 
         // Retrieve the full header
         size_t remainingHeaderSize = this->GetBaseHeader()->numFiles * sizeof(PFS0FileEntry) + this->GetBaseHeader()->stringTableSize;
         m_headerBytes.resize(sizeof(PFS0BaseHeader) + remainingHeaderSize, 0);
         this->BufferData(m_headerBytes.data() + sizeof(PFS0BaseHeader), sizeof(PFS0BaseHeader), remainingHeaderSize);
 
-        FILE* dbg3 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg3) { fprintf(dbg3, "RetrieveHeader: complete, header size=%zu\n", m_headerBytes.size()); fclose(dbg3); }
+        DBG_LOG("RetrieveHeader: complete, header size=%zu\n", m_headerBytes.size());
 
         LOG_DEBUG("Full header: \n");
         printBytes(m_headerBytes.data(), m_headerBytes.size(), true);

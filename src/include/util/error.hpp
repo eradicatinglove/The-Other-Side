@@ -49,3 +49,11 @@ SOFTWARE.
 #else
 #define LOG_DEBUG(format, ...) ;
 #endif
+
+// same on/off switch as LOG_DEBUG above, just writes to its own file since
+// that's what all the install/shop debugging this whole session used
+#ifdef APP_DEBUG_LOG
+#define DBG_LOG(...) do { FILE* _dbgLogFile = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a"); if (_dbgLogFile) { fprintf(_dbgLogFile, __VA_ARGS__); fclose(_dbgLogFile); } } while (0)
+#else
+#define DBG_LOG(...) do {} while (0)
+#endif

@@ -1,6 +1,7 @@
 #include <curl/curl.h>
 #include <zstd.h>
 #include <webp/decode.h>
+#include "util/error.hpp"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <borealis/extern/stb_image/stb_image_write.h>
 #include <stdint.h>
@@ -36,10 +37,13 @@
 #include "install/sdmc_xci.hpp"
 #include "install/http_nsp.hpp"
 #include "install/http_xci.hpp"
+#include "install/http_stream_nsp.hpp"
+#include "pinned_status_view.hpp"
+#include "nx/usbhdd.h"
 #include "nx/ipc/es.h"
 #include "nx/ipc/ns_ext.h"
 #include "mtp_server.hpp"
-#include "pinned_status_view.hpp"
+#include "ftp.h"
 #include "ui/instPage.hpp"
 #include "ui/MainApplication.hpp"
 #include "util/config.hpp"
@@ -51,6 +55,7 @@ using namespace i18n::literals;
 
 
 #define LOCATIONS_PATH  "sdmc:/switch/TheOtherSide/locations.conf"
+#define PRIMARY_SHOP_PATH "sdmc:/switch/TheOtherSide/primary_shop.txt"
 #define ICON_CACHE_DIR  "sdmc:/switch/TheOtherSide/icon_cache"
 #define LOCATIONS_DIR   "sdmc:/switch/TheOtherSide"
 #define TINCLONE_UA    "Tinfoil/20.00 (Nintendo Switch; en-US)"
@@ -79,6 +84,11 @@ std::vector<std::string> g_titleUrls;
 
 
 std::vector<std::string> g_titleIconUrls;
+// shop-provided type ("base"/"update"/"dlc"/etc), empty if the shop doesn't tell us -
+// kept parallel to the vectors above, one entry per title
+std::vector<std::string> g_titleKind;
+// raw app_version from the shop (same [vXXXXX] style already used in filenames), empty if unknown
+std::vector<std::string> g_titleVersion;
 
 
 std::mutex g_titleDataMutex;
@@ -263,17 +273,13 @@ std::string httpGet(const std::string& url,
     if (headers) curl_slist_free_all(headers);
 
     mkdir("sdmc:/switch/TheOtherSide", 0777);
-    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-    if (dbg) {
-        fprintf(dbg, "URL: %s\n", url.c_str());
-        fprintf(dbg, "CURLcode: %d (%s)\n", res, curl_easy_strerror(res));
-        fprintf(dbg, "HTTP code: %ld\n", httpCode);
-        fprintf(dbg, "Response size: %zu\n", response.size());
-        if (!response.empty())
-            fprintf(dbg, "Response (first 500):\n%.500s\n", response.c_str());
-        fprintf(dbg, "---\n");
-        fclose(dbg);
-    }
+    DBG_LOG("URL: %s\n", url.c_str());
+    DBG_LOG("CURLcode: %d (%s)\n", res, curl_easy_strerror(res));
+    DBG_LOG("HTTP code: %ld\n", httpCode);
+    DBG_LOG("Response size: %zu\n", response.size());
+    if (!response.empty())
+        DBG_LOG("Response (first 500):\n%.500s\n", response.c_str());
+    DBG_LOG("---\n");
     curl_easy_cleanup(curl);
     return response;
 }
@@ -294,8 +300,7 @@ std::string decodeTinfoilResponse(const std::string& raw) {
     size_t payloadLen = raw.size() - kZstdPayloadOffset;
 
     auto logErr = [](const char* msg) {
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) { fprintf(dbg, "%s\n", msg); fclose(dbg); }
+        DBG_LOG("%s\n", msg);
     };
 
 
@@ -390,14 +395,12 @@ static void loadIconIndexIfNeeded() {
         g_iconIndex[s.substr(0, sep)] = s.substr(sep + 1);
     }
     fclose(f);
-    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-    if (dbg) { fprintf(dbg, "icon index loaded: %zu entries\n", g_iconIndex.size()); fclose(dbg); }
+    DBG_LOG("icon index loaded: %zu entries\n", g_iconIndex.size());
 }
 
 
 bool buildIconIndex() {
-    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-    if (dbg) { fprintf(dbg, "icon index: starting download\n"); fclose(dbg); }
+    DBG_LOG("icon index: starting download\n");
 
 
     std::string tmpPath = "sdmc:/switch/TheOtherSide/titledb_tmp.json";
@@ -440,8 +443,7 @@ bool buildIconIndex() {
 
     if (res != CURLE_OK || httpCode != 200) {
         remove(tmpPath.c_str());
-        FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg2) { fprintf(dbg2, "icon index: download failed rc=%d http=%ld\n", res, httpCode); fclose(dbg2); }
+        DBG_LOG("icon index: download failed rc=%d http=%ld\n", res, httpCode);
         return false;
     }
 
@@ -496,8 +498,7 @@ bool buildIconIndex() {
     }
     loadIconIndexIfNeeded();
 
-    FILE* dbg3 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-    if (dbg3) { fprintf(dbg3, "icon index: wrote %zu entries\n", written); fclose(dbg3); }
+    DBG_LOG("icon index: wrote %zu entries\n", written);
     return written > 0;
 }
 
@@ -623,8 +624,7 @@ public:
                             fclose(f);
 
                             if (res == CURLE_OK) {
-                                FILE* dbgUpd = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                                if (dbgUpd) { fprintf(dbgUpd, "update downloaded\n"); fclose(dbgUpd); }
+                                DBG_LOG("update downloaded\n");
 
 
                                 struct stat dlSt;
@@ -638,11 +638,10 @@ public:
                                 } else {
                                     remove(tmpNro.c_str());
                                     std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                                    g_pendingNotifications.push_back("Update download looked incomplete — please try again");
+                                    g_pendingNotifications.push_back("Update download looked incomplete, please try again");
                                 }
                             } else {
-                                FILE* dbgUpd = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                                if (dbgUpd) { fprintf(dbgUpd, "update download failed: rc=%d\n", res); fclose(dbgUpd); }
+                                DBG_LOG("update download failed: rc=%d\n", res);
                                 remove(tmpNro.c_str());
                                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                                 g_pendingNotifications.push_back("Update download failed");
@@ -714,7 +713,7 @@ static void ensureIconApplyTaskRunning() {
 enum class ShopFormat : int { TinfoilLegacy = 0, CyberFoil = 1 };
 
 struct Location {
-    std::string protocol, url, port, username, password, path;
+    std::string protocol, url, port, username, password, path, title;
     ShopFormat format = ShopFormat::TinfoilLegacy;
 };
 
@@ -740,18 +739,15 @@ void saveLocations(const std::vector<Location>& locs) {
     mkdir(LOCATIONS_DIR, 0777);
     FILE* f = fopen(LOCATIONS_PATH, "w");
     if (!f) return;
-    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
     for (auto& loc : locs) {
-        fprintf(f, "%s|%s|%s|%s|%s|%s|%d\n",
+        fprintf(f, "%s|%s|%s|%s|%s|%s|%d|%s\n",
             loc.protocol.c_str(), loc.url.c_str(), loc.port.c_str(),
             loc.username.c_str(), loc.password.c_str(), loc.path.c_str(),
-            (int)loc.format);
-        if (dbg)
-            fprintf(dbg, "saveLocations: proto=[%s] url=[%s] port=[%s] user=[%s] path=[%s] format=[%d]\n",
-                loc.protocol.c_str(), loc.url.c_str(), loc.port.c_str(),
-                loc.username.c_str(), loc.path.c_str(), (int)loc.format);
+            (int)loc.format, loc.title.c_str());
+        DBG_LOG("saveLocations: proto=[%s] url=[%s] port=[%s] user=[%s] path=[%s] format=[%d] title=[%s]\n",
+            loc.protocol.c_str(), loc.url.c_str(), loc.port.c_str(),
+            loc.username.c_str(), loc.path.c_str(), (int)loc.format, loc.title.c_str());
     }
-    if (dbg) fclose(dbg);
     fclose(f);
 }
 
@@ -803,20 +799,105 @@ std::vector<Location> loadLocations() {
             loc.format = (loc.url.find("ghostland.at") != std::string::npos)
                 ? ShopFormat::CyberFoil : ShopFormat::TinfoilLegacy;
         }
+        if (parts.size() > 7 && !parts[7].empty()) loc.title = parts[7];
+        else loc.title = loc.url;
         if (!loc.url.empty()) locs.push_back(loc);
     }
     fclose(f);
     return locs;
 }
 
+static std::string loadPrimaryShopUrl() {
+    FILE* f = fopen(PRIMARY_SHOP_PATH, "r");
+    if (!f) return "";
+    char buf[256] = {};
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return ""; }
+    fclose(f);
+    std::string s(buf);
+    while (!s.empty() && (s.back()=='\n'||s.back()=='\r')) s.pop_back();
+    return s;
+}
+
+static void savePrimaryShopUrl(const std::string& url) {
+    mkdir(LOCATIONS_DIR, 0777);
+    FILE* f = fopen(PRIMARY_SHOP_PATH, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", url.c_str());
+    fclose(f);
+}
+
+
 
 // grabs the shop listings on startup
-void doFetch() {
+// runs once right after a fetch finishes - rewrites update/DLC entries to
+// include their base game's name, so search and display both see it
+// (doing this once here instead of at display time means search actually
+// works against the full name, not just whatever the shop called it)
+static void fixUpdateDlcNames() {
+    std::lock_guard<std::mutex> lock(g_titleDataMutex);
+
+    // build a prefix -> base game name lookup in one pass, instead of
+    // rescanning the whole list for every update/DLC entry
+    std::unordered_map<std::string, std::string> baseNameByPrefix;
+    baseNameByPrefix.reserve(g_titleNames.size());
+    for (size_t j = 0; j < g_titleIds.size(); j++) {
+        std::string jKind = j < g_titleKind.size() ? g_titleKind[j] : "";
+        bool jIsBase = (jKind == "base" || jKind == "game" || jKind == "0");
+        if (!jIsBase || g_titleNames[j].empty() || g_titleIds[j].size() < 13) continue;
+        baseNameByPrefix[g_titleIds[j].substr(0, 13)] = g_titleNames[j];
+    }
+
+    for (size_t i = 0; i < g_titleNames.size(); i++) {
+        std::string kind = i < g_titleKind.size() ? g_titleKind[i] : "";
+        if (kind.empty()) continue;
+
+        bool isUpdate = (kind == "update" || kind == "patch" || kind == "1");
+        bool isDlc = !isUpdate && kind != "base" && kind != "game" && kind != "0";
+        if (!isUpdate && !isDlc) continue;
+
+        const std::string& tid = g_titleIds[i];
+        if (tid.size() < 13) continue;
+
+        auto it = baseNameByPrefix.find(tid.substr(0, 13));
+        if (it == baseNameByPrefix.end()) continue;
+        const std::string& baseName = it->second;
+
+        if (isUpdate) {
+            std::string version = i < g_titleVersion.size() ? g_titleVersion[i] : "";
+            g_titleNames[i] = baseName + " (Update)"
+                + (version.empty() ? "" : " [v" + version + "]");
+        } else {
+            // keep whatever specific label the shop gave this DLC piece,
+            // just make sure the game name is actually in there too
+            if (g_titleNames[i].find(baseName) == std::string::npos)
+                g_titleNames[i] = baseName + " - " + g_titleNames[i];
+        }
+    }
+}
+
+void doFetch(int specificShopIndex = -1) {
     auto locs = loadLocations();
     if (locs.empty()) {
         g_fetchStatus = "No shops configured. Go to Options to add one.";
         g_fetchDone   = true;
         return;
+    }
+    if (specificShopIndex >= 0 && specificShopIndex < (int)locs.size()) {
+        Location chosen = locs[specificShopIndex];
+        locs.clear();
+        locs.push_back(chosen);
+    } else {
+        std::string primaryUrl = loadPrimaryShopUrl();
+        if (!primaryUrl.empty()) {
+            for (auto& l : locs) {
+                if (l.url == primaryUrl) {
+                    Location chosen = l;
+                    locs.clear();
+                    locs.push_back(chosen);
+                    break;
+                }
+            }
+        }
     }
 
     {
@@ -824,12 +905,8 @@ void doFetch() {
         u32 wifiStrength;
         NifmInternetConnectionStatus connStatus;
         Result rc = nifmGetInternetConnectionStatus(&connType, &wifiStrength, &connStatus);
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) {
-            fprintf(dbg, "nifm rc: 0x%x connType:%d wifiStr:%u connStatus:%d\n",
+        DBG_LOG("nifm rc: 0x%x connType:%d wifiStr:%u connStatus:%d\n",
                 rc, (int)connType, wifiStrength, (int)connStatus);
-            fclose(dbg);
-        }
         if (R_FAILED(rc) || connStatus != NifmInternetConnectionStatus_Connected) {
             g_fetchStatus = "No internet connection";
             g_fetchDone = true;
@@ -855,12 +932,15 @@ void doFetch() {
         if (!rootUrl.empty() && rootUrl.back() == '/') rootUrl.pop_back();
 
 
-        bool isGhostland = loc.url.find("ghostland.at") != std::string::npos;
+        // only the actual public shop uses this CyberFoil-style endpoint -
+        // nx-retro.ghostland.at needs the plain Tinfoil-legacy path below,
+        // since its real catalog is reached through a "directories" pointer
+        bool isGhostland = loc.url.find("nx.ghostland.at") != std::string::npos;
         if (isGhostland || loc.format == ShopFormat::CyberFoil) {
             std::string cfUrl;
             std::string hauthHeader;
             if (isGhostland) {
-                cfUrl = proto + "://nx.ghostland.at/api/shop/sections";
+                cfUrl = proto + "://" + loc.url + "/api/shop/sections";
                 hauthHeader = "HAUTH: D0634E67FCF4DBD14DA344ACDC45E4BE";
             } else {
 
@@ -910,13 +990,9 @@ void doFetch() {
                 long httpCode = 0;
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
                 curl_easy_cleanup(curl);
-                FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                if (dbg) {
-                    fprintf(dbg, "%s: rc=%d http=%ld size=%zu\n",
+                DBG_LOG("%s: rc=%d http=%ld size=%zu\n",
                             isGhostland ? "Ghost eShop" : ("CyberFoil shop [" + loc.url + "]").c_str(),
                             res, httpCode, json.size());
-                    fclose(dbg);
-                }
             }
             curl_slist_free_all(gh);
 
@@ -947,30 +1023,21 @@ void doFetch() {
                     std::string name = getF("name");
                     std::string url = getF("url");
                     std::string iconUrl = getF("icon_url");
+                    std::string kind = getF("app_type");
+                    for (auto& c : kind) c = tolower(c);
+                    std::string version = getF("app_version");
 
                     if (!tid.empty() && !name.empty() && !url.empty()) {
 
-                        if (url.size() > 5 && url.substr(0, 5) == "jbod:") {
-                            size_t slash = url.find('/', 5);
-                            if (slash != std::string::npos) {
-                                std::string encoded = url.substr(slash + 1);
-                                std::string decoded;
-                                for (size_t i = 0; i < encoded.size(); i++) {
-                                    if (encoded[i] == '%' && i + 2 < encoded.size()) {
-                                        int val; sscanf(encoded.substr(i+1,2).c_str(), "%x", &val);
-                                        decoded += (char)val; i += 2;
-                                    } else decoded += encoded[i];
-                                }
-                                size_t hash = decoded.find('#');
-                                if (hash != std::string::npos) decoded = decoded.substr(0, hash);
-                                url = decoded;
-                            }
-                        }
+                        // jbod: URLs (split/multi-part titles) get parsed properly
+                        // by HTTPDownload later - leave them intact here
                         {
                             std::lock_guard<std::mutex> lock(g_titleDataMutex);
                             g_titleNames.push_back(name);
                             g_titleIds.push_back(tid);
                             g_titleUrls.push_back(url);
+                            g_titleKind.push_back(kind);
+                            g_titleVersion.push_back(version);
                             g_titleIconUrls.push_back(iconUrl);
                         }
                     }
@@ -983,6 +1050,7 @@ void doFetch() {
                     if (anyTitles) g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
                 }
                 if (anyTitles) {
+                    fixUpdateDlcNames();
                     g_fetchDone = true;
                     return;
                 }
@@ -996,14 +1064,36 @@ void doFetch() {
 
         if (!json.empty() && json.compare(0, 7, "TINFOIL") == 0) {
             std::string decoded = decodeTinfoilResponse(json);
-            FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbg) {
-                fprintf(dbg, "Detected TINFOIL container, decoded size: %zu\n", decoded.size());
-                fclose(dbg);
-            }
+            DBG_LOG("Detected TINFOIL container, decoded size: %zu\n", decoded.size());
             json = decoded;
         }
 
+        // some shops (Ghost eShop RETRO among them) point at their real
+        // catalog through a "directories" array instead of listing files
+        // directly - follow those and merge their files in before parsing
+        if (!json.empty() && json.find("\"directories\"") != std::string::npos) {
+            size_t dirPos = json.find("\"directories\"");
+            size_t dirArrStart = json.find('[', dirPos);
+            size_t dirArrEnd = json.find(']', dirArrStart);
+            if (dirArrStart != std::string::npos && dirArrEnd != std::string::npos) {
+                std::string dirArr = json.substr(dirArrStart, dirArrEnd - dirArrStart + 1);
+                size_t dp = 0;
+                while ((dp = dirArr.find('"', dp)) != std::string::npos) {
+                    size_t de = dirArr.find('"', dp + 1);
+                    if (de == std::string::npos) break;
+                    std::string dirUrl = dirArr.substr(dp + 1, de - dp - 1);
+                    dp = de + 1;
+                    if (dirUrl.find("://") == std::string::npos) continue;
+
+                    g_fetchStatus = "Fetching " + dirUrl + "...";
+                    std::string dirJson = httpGet(dirUrl, loc.username, loc.password);
+                    if (!dirJson.empty() && dirJson.compare(0, 7, "TINFOIL") == 0)
+                        dirJson = decodeTinfoilResponse(dirJson);
+                    if (!dirJson.empty() && dirJson.find("\"files\"") != std::string::npos)
+                        json += dirJson;
+                }
+            }
+        }
 
         if (!json.empty() && json.find("\"files\"") != std::string::npos) {
 
@@ -1066,12 +1156,14 @@ void doFetch() {
                     size_t nameEnd = lb != std::string::npos ? lb : decoded.size();
                     while (nameEnd > 0 && (decoded[nameEnd-1]==' '||decoded[nameEnd-1]=='.')) nameEnd--;
                     if (nameEnd > 0) cleanName = decoded.substr(0, nameEnd);
+
                     if (!url.empty()) {
                         std::lock_guard<std::mutex> lock(g_titleDataMutex);
                         g_titleNames.push_back(cleanName.empty() ? decoded : cleanName);
                         g_titleIds.push_back(tid);
                         g_titleUrls.push_back(url);
                         g_titleIconUrls.push_back("");
+                        g_titleKind.push_back(""); g_titleVersion.push_back("");
                     }
                 }
             }
@@ -1079,6 +1171,7 @@ void doFetch() {
                 std::lock_guard<std::mutex> lock(g_titleDataMutex);
                 g_fetchStatus = std::to_string(g_titleNames.size()) + " titles loaded";
             }
+            fixUpdateDlcNames();
             g_fetchDone = true;
 
 
@@ -1186,6 +1279,7 @@ void doFetch() {
                 g_titleIds.push_back(tid);
                 g_titleUrls.push_back(url);
                 g_titleIconUrls.push_back("");
+                g_titleKind.push_back(""); g_titleVersion.push_back("");
             }
         }
     }
@@ -1289,7 +1383,7 @@ void frame_showInstalled() {
 void frame_showFileBrowser(const std::string& path) {
     brls::AppletFrame* frame = new brls::AppletFrame(true, true);
     frame->setTitle("File Browser");
-    frame->setIcon(BOREALIS_ASSET("icon/filebrowser.jpg"));
+    frame->setIcon(BOREALIS_ASSET("icon/filebrowser.png"));
     brls::List* list = new brls::List();
 
     std::vector<std::string> dirs, files;
@@ -1590,8 +1684,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
         brls::Dialog* dlg = new brls::Dialog("Install from shop?\n\n" + n);
         dlg->addButton("Install", [dlg, n, u](brls::View*) {
             dlg->close([n, u](){
-                FILE* dbgPre = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                if (dbgPre) { fprintf(dbgPre, "install button pressed: %s -> %s\n", n.c_str(), u.c_str()); fclose(dbgPre); }
+                DBG_LOG("install button pressed: %s -> %s\n", n.c_str(), u.c_str());
 
                 if (g_installInProgress.load()) {
                     brls::Application::notify("Install already in progress - please wait");
@@ -1605,11 +1698,14 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                 thrd_t t;
                 int createResult = thrd_create(&t, [](void* p) -> int {
                     BgThreadGuard bgGuard;
+                    // clears no matter how the thread exits so we never get stuck on "already in progress"
+                    struct InProgressGuard {
+                        ~InProgressGuard() { g_installInProgress.store(false); }
+                    } inProgressGuard;
                     auto* a = static_cast<NetArgs*>(p);
                     if (!a->user.empty())
                         tin::network::SetBasicAuth(a->user, a->pass);
-                    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                    if (dbg) { fprintf(dbg, "install start: %s -> %s\n", a->n.c_str(), a->u.c_str()); fclose(dbg); }
+                    DBG_LOG("install start: %s -> %s\n", a->n.c_str(), a->u.c_str());
 
                     std::string lurl = a->u;
                     for (auto& c : lurl) c = tolower(c);
@@ -1618,14 +1714,7 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                     else if (lurl.find(".xci") != std::string::npos) ext = ".xci";
                     else if (lurl.find(".xcz") != std::string::npos) ext = ".xcz";
 
-                    const std::string tempDir = "sdmc:/switch/TheOtherSide/temp";
-                    std::string safeId;
-                    for (char c : a->n) { if (isalnum(c)||c==' '||c=='-') safeId+=c; if(safeId.size()>40)break; }
-                    if (safeId.empty()) safeId = "game";
-                    const std::string tempPath = tempDir + "/" + safeId + ext;
-                    mkdir(tempDir.c_str(), 0777);
-
-                    // keep the console awake for the whole download+install, not just the install part
+                    // keep the console awake through the whole install
                     struct AwakeGuard {
                         AwakeGuard()  { appletSetMediaPlaybackState(true); }
                         ~AwakeGuard() { appletSetMediaPlaybackState(false); }
@@ -1635,107 +1724,86 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
 
                         {
                             std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                            g_pendingNotifications.push_back("Downloading " + a->n + "...");
+                            g_pendingNotifications.push_back("Installing " + a->n + "...");
                         }
 
-                        std::string dlUrl = a->u;
-                        if (!a->user.empty()) {
-                            size_t se = dlUrl.find("://");
-                            if (se != std::string::npos)
-                                dlUrl = dlUrl.substr(0,se+3)+a->user+":"+a->pass+"@"+dlUrl.substr(se+3);
-                        }
-
-                        FILE* outFile = fopen(tempPath.c_str(), "wb");
-                        if (!outFile) throw std::runtime_error("Failed to open temp file");
-                        CURL* curl = curl_easy_init();
-                        if (!curl) { fclose(outFile); throw std::runtime_error("curl_easy_init failed"); }
-
-                        uint64_t totalBytes = 0;
-                        struct DlCtx { FILE* f; uint64_t* total; };
-                        DlCtx dlCtx{outFile, &totalBytes};
-
-                        auto writeFunc = +[](char* ptr, size_t sz, size_t n, void* ud) -> size_t {
-                            auto* ctx = static_cast<DlCtx*>(ud);
-                            size_t w = fwrite(ptr, sz, n, ctx->f);
-                            *ctx->total += w * sz;
-                            return w * sz;
-                        };
-                        static int s_lastNotifyPct = -1; s_lastNotifyPct = -1;
-                        auto xferFunc = +[](void*, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) -> int {
-                            if (dltotal<=0||dlnow<=0) return 0;
-                            int pct = (int)(100.0*dlnow/dltotal);
-                            if (pct > s_lastNotifyPct) {
-                                s_lastNotifyPct = pct;
-                                double mbNow=dlnow/1048576.0, mbTotal=dltotal/1048576.0;
-                                char msg[64]; snprintf(msg,sizeof(msg),"DL %.0f/%.0f MB (%d%%)",mbNow,mbTotal,pct);
-                                std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                                g_pendingNotifications.push_back(msg);
-                            }
-                            return 0;
-                        };
-
-                        curl_easy_setopt(curl, CURLOPT_URL, dlUrl.c_str());
-                        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, false);
-                        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-                        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-                        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-                        curl_easy_setopt(curl, CURLOPT_USERAGENT, "");
-                        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dlCtx);
-                        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeFunc);
-                        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-                        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferFunc);
-                        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
-
-                        CURLcode rc = curl_easy_perform(curl);
-                        curl_easy_cleanup(curl);
-                        fclose(outFile);
-
-                        if (rc != CURLE_OK) {
-                            remove(tempPath.c_str());
-                            throw std::runtime_error(std::string("Download failed: ")+curl_easy_strerror(rc));
-                        }
-
-                        FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt","a");
-                        if (dbg2) { fprintf(dbg2,"download complete: %llu bytes\n",(unsigned long long)totalBytes); fclose(dbg2); }
-
-
-                        {
-                            std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
-                            g_pendingNotifications.push_back("Installing...");
-                        }
+                        // straight into the install, no temp file
                         ncmInitialize();
                         nsextInitialize();
                         esInitialize();
                         splCryptoInitialize();
                         splInitialize();
 
+                        // single-part jbod: urls aren't really "split" - unwrap to
+                        // a plain url for the fast streamer. multi-part titles use
+                        // the jbod-parts streamer instead of the old Range-based path
+                        std::string effectiveUrl = a->u;
+                        bool isTrueJbod = false;
+                        std::vector<std::string> jbodPartUrls;
+                        if (effectiveUrl.size() > 5 && effectiveUrl.compare(0, 5, "jbod:") == 0) {
+                            std::string payload = effectiveUrl.substr(5);
+                            std::vector<std::string> tokens;
+                            size_t tpos = 0;
+                            while (tpos <= payload.size()) {
+                                size_t slash = payload.find('/', tpos);
+                                std::string tok = (slash == std::string::npos) ? payload.substr(tpos) : payload.substr(tpos, slash - tpos);
+                                if (!tok.empty()) tokens.push_back(tok);
+                                if (slash == std::string::npos) break;
+                                tpos = slash + 1;
+                            }
+                            std::vector<std::string> urlTokens;
+                            for (size_t i = 1; i < tokens.size(); i++) {
+                                bool allDigits = !tokens[i].empty();
+                                for (char c : tokens[i]) { if (!isdigit((unsigned char)c)) { allDigits = false; break; } }
+                                if (!allDigits) urlTokens.push_back(tokens[i]);
+                            }
+                            for (const auto& encoded : urlTokens) {
+                                std::string decoded;
+                                for (size_t i = 0; i < encoded.size(); i++) {
+                                    if (encoded[i] == '%' && i + 2 < encoded.size()) {
+                                        int val; sscanf(encoded.substr(i+1,2).c_str(), "%x", &val);
+                                        decoded += (char)val; i += 2;
+                                    } else decoded += encoded[i];
+                                }
+                                size_t hash = decoded.find('#');
+                                if (hash != std::string::npos) decoded = decoded.substr(0, hash);
+                                jbodPartUrls.push_back(decoded);
+                            }
+                            if (jbodPartUrls.size() == 1) {
+                                effectiveUrl = jbodPartUrls[0];
+                            } else if (jbodPartUrls.size() > 1) {
+                                isTrueJbod = true;
+                            }
+                        }
+
                         if (ext == ".xci" || ext == ".xcz") {
-                            auto xci = std::make_shared<tin::install::xci::SDMCXCI>(tempPath);
+                            auto xci = std::make_shared<tin::install::xci::HTTPXCI>(effectiveUrl);
                             tin::install::xci::XCIInstallTask task(NcmStorageId_SdCard, false, xci);
                             task.Prepare();
                             task.Begin();
+                        } else if (isTrueJbod) {
+                            // real multi-part titles - download each part in full,
+                            // in order, feeding them as one continuous logical file
+                            tin::install::nsp::InstallNspHttpStreamJbodParts(
+                                jbodPartUrls, a->user, a->pass, NcmStorageId_SdCard, false);
                         } else {
-                            auto nsp = std::make_shared<tin::install::nsp::SDMCNSP>(tempPath);
-                            tin::install::nsp::NSPInstall task(NcmStorageId_SdCard, false, nsp);
-                            task.Prepare();
-                            task.Begin();
+                            // one sequential connection, no Range requests - same pattern
+                            // as the old temp-file download, just skips the temp file
+                            tin::install::nsp::InstallNspHttpStreamSequential(
+                                effectiveUrl, a->user, a->pass, NcmStorageId_SdCard, false);
                         }
 
                         splExit(); splCryptoExit(); esExit(); nsextExit(); ncmExit();
-                        remove(tempPath.c_str());
 
-                        FILE* dbg3 = fopen("sdmc:/switch/TheOtherSide/debug.txt","a");
-                        if (dbg3) { fprintf(dbg3,"install SUCCESS: %s\n",a->n.c_str()); fclose(dbg3); }
+                        DBG_LOG("install SUCCESS: %s\n",a->n.c_str());
                         g_installInProgress.store(false);
                         std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                         g_pendingNotifications.push_back("Installed: " + a->n);
 
                     } catch (std::exception& e) {
                         std::string err = e.what();
-                        remove(tempPath.c_str());
                         splExit(); splCryptoExit(); esExit(); nsextExit(); ncmExit();
-                        FILE* dbg4 = fopen("sdmc:/switch/TheOtherSide/debug.txt","a");
-                        if (dbg4) { fprintf(dbg4,"install FAILED: %s\n",err.c_str()); fclose(dbg4); }
+                        DBG_LOG("install FAILED: %s\n",err.c_str());
                         g_installInProgress.store(false);
                         std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
                         g_pendingNotifications.push_back("Install failed: " + err.substr(0, 60));
@@ -1745,10 +1813,9 @@ static brls::ListItem* buildShopTitleItem(const std::string& name, const std::st
                 }, args);
                 if (createResult == thrd_success) {
                     thrd_detach(t);
-                    brls::Application::notify("Starting download...");
+                    brls::Application::notify("Starting download & install...");
                 } else {
-                    FILE* dbgFail = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                    if (dbgFail) { fprintf(dbgFail, "install thread creation FAILED, code=%d\n", createResult); fclose(dbgFail); }
+                    DBG_LOG("install thread creation FAILED, code=%d\n", createResult);
                     brls::Application::notify("Install failed to start (thread error)");
                     delete args;
                 }
@@ -1767,6 +1834,43 @@ static const size_t kShopPageSize = 60;
 
 static std::string showKeyboard(const std::string& guide, const std::string& initial, int maxLen);
 
+static void showShopPicker() {
+    auto locs = loadLocations();
+    if (locs.empty()) {
+        brls::Application::notify("No shops added yet - add one in Options first");
+        return;
+    }
+
+    brls::AppletFrame* frame = new brls::AppletFrame(true, true);
+    frame->setTitle("Choose primary shop");
+    frame->setIcon(BOREALIS_ASSET("icon/games.png"));
+    brls::List* list = new brls::List();
+
+    std::string currentPrimary = loadPrimaryShopUrl();
+
+    for (size_t i = 0; i < locs.size(); i++) {
+        std::string subtitle = (locs[i].url == currentPrimary) ? "Current primary shop" : "";
+        brls::ListItem* item = new brls::ListItem(locs[i].url, subtitle);
+        std::string url = locs[i].url;
+        item->getClickEvent()->subscribe([url](brls::View*) {
+            savePrimaryShopUrl(url);
+            {
+                std::lock_guard<std::mutex> lock(g_titleDataMutex);
+                g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); g_titleKind.clear(); g_titleVersion.clear();
+            }
+            g_fetchDone = false; g_fetchCancel = false;
+            thrd_t ft;
+            thrd_create(&ft, [](void*)->int{ BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
+            thrd_detach(ft);
+            brls::Application::notify("Primary shop set to " + url);
+        });
+        list->addView(item);
+    }
+
+    frame->setContentView(list);
+    brls::Application::pushView(frame);
+}
+
 // shop stuff
 void frame_showShop(const std::string& category, const std::string& typeFilter) {
     g_shopScreenGeneration.fetch_add(1);
@@ -1774,7 +1878,7 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
 
     brls::AppletFrame* frame = new brls::AppletFrame(true, true);
     frame->setTitle(category);
-    frame->setIcon(BOREALIS_ASSET("icon/games.jpg"));
+    frame->setIcon(BOREALIS_ASSET("icon/games.png"));
     brls::List* list = new brls::List();
 
     bool titlesEmpty;
@@ -1806,15 +1910,30 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
                 std::lock_guard<std::mutex> lock(g_titleDataMutex);
                 for (size_t i = 0; i < g_titleNames.size(); i++) {
                     const std::string& tid = g_titleIds[i];
-
-                    std::string suffix = tid.size() >= 3 ? tid.substr(tid.size() - 3) : "";
-                    for (auto& c : suffix) c = toupper(c);
+                    const std::string& kind = (i < g_titleKind.size()) ? g_titleKind[i] : "";
 
                     bool typeMatch = true;
-                    if (*currentFilter == "games")
-                        typeMatch = (suffix == "000");
-                    else if (*currentFilter == "updates")
-                        typeMatch = (suffix != "000");
+                    if (!kind.empty()) {
+                        // shop told us directly - trust that over guessing from the ID,
+                        // since not every shop uses real Nintendo-style title IDs
+                        if (*currentFilter == "games")
+                            typeMatch = (kind == "base" || kind == "game" || kind == "0");
+                        else if (*currentFilter == "updates")
+                            typeMatch = (kind == "update" || kind == "patch" || kind == "1");
+                        else if (*currentFilter == "dlc")
+                            typeMatch = (kind == "dlc" || kind == "addon" || kind == "add-on" ||
+                                         (kind != "0" && kind != "1" && kind != "base" &&
+                                          kind != "game" && kind != "update" && kind != "patch"));
+                    } else {
+                        std::string suffix = tid.size() >= 3 ? tid.substr(tid.size() - 3) : "";
+                        for (auto& c : suffix) c = toupper(c);
+                        if (*currentFilter == "games")
+                            typeMatch = (suffix == "000");
+                        else if (*currentFilter == "updates")
+                            typeMatch = (suffix == "800");
+                        else if (*currentFilter == "dlc")
+                            typeMatch = (suffix != "000" && suffix != "800");
+                    }
 
                     if (!typeMatch) continue;
 
@@ -1833,7 +1952,7 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
             if (filter.empty())
                 searchBtn->setValue(std::to_string(matches.size()) + " titles");
             else
-                searchBtn->setValue("\"" + *searchTerm + "\" — " + std::to_string(matches.size()) + " results");
+                searchBtn->setValue("\"" + *searchTerm + "\" (" + std::to_string(matches.size()) + " results)");
 
             auto loadedCount = std::make_shared<size_t>(0);
             brls::ListItem* loadMoreBtn = new brls::ListItem("Load more...", "");
@@ -1877,12 +1996,8 @@ void frame_showShop(const std::string& category, const std::string& typeFilter) 
                     double hasIconMs = armTicksToNs(g_hasIconTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
                     double statMs = armTicksToNs(g_statTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
                     double readMs = armTicksToNs(g_readTicksAccum.load(std::memory_order_relaxed)) / 1000000.0;
-                    FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-                    if (dbg) {
-                        fprintf(dbg, "page load: %zu titles, total=%.1fms buildShopTitleItem=%.1fms addView=%.1fms HasIcon=%.1fms stat=%.1fms fileRead=%.1fms\n",
+                    DBG_LOG("page load: %zu titles, total=%.1fms buildShopTitleItem=%.1fms addView=%.1fms HasIcon=%.1fms stat=%.1fms fileRead=%.1fms\n",
                                 end - start, totalMs, buildMs, addViewMs, hasIconMs, statMs, readMs);
-                        fclose(dbg);
-                    }
                 }
                 *loadedCount = end;
                 if (end < matches.size()) {
@@ -2004,6 +2119,7 @@ static void showAddShopDialog(std::function<void()> onDone = nullptr) {
 
 
     std::string title = showKeyboard("Step 6 of 7 - Title (display name only)", loc.url);
+    loc.title = title.empty() ? loc.url : title;
 
 
     std::string fmt = showKeyboard("Step 7 of 7 - Format: type TINFOIL or CYBERFOIL (leave blank for TINFOIL)", "");
@@ -2027,7 +2143,7 @@ static void showAddShopDialog(std::function<void()> onDone = nullptr) {
             saveLocations(locs);
 
             { std::lock_guard<std::mutex> lock(g_titleDataMutex);
-              g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); }
+              g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); g_titleKind.clear(); g_titleVersion.clear(); }
             g_fetchDone = false; g_fetchCancel = false;
             thrd_t ft;
             thrd_create(&ft, [](void*)->int{ BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
@@ -2056,6 +2172,12 @@ void populateOptionsList(brls::List* list) {
     });
     list->addView(addCustom);
 
+    brls::ListItem* chooseShop = new brls::ListItem("Choose primary shop", "Pick which saved shop to use - sticks until changed");
+    chooseShop->getClickEvent()->subscribe([](brls::View*) {
+        showShopPicker();
+    });
+    list->addView(chooseShop);
+
 
     brls::ListItem* buildIdx = new brls::ListItem("Build icon index", "Downloads ~80MB once, enables icons for new titles");
     buildIdx->getClickEvent()->subscribe([](brls::View*) {
@@ -2082,7 +2204,7 @@ void populateOptionsList(brls::List* list) {
 
 
     brls::ListItem* migrateIcons = new brls::ListItem("Migrate icon cache to subfolders",
-        "One-time fix for existing icon_cache/ — spreads icons across subfolders");
+        "One-time fix for existing icon_cache/, spreads icons across subfolders");
     migrateIcons->getClickEvent()->subscribe([](brls::View*) {
         bool expected = false;
         if (!g_iconCacheMigrationInProgress.compare_exchange_strong(expected, true)) {
@@ -2110,10 +2232,12 @@ void populateOptionsList(brls::List* list) {
     list->addView(migrateIcons);
 
 
-    brls::ListItem* mtpItem = new brls::ListItem("MTP Install Mode", inst::mtp::IsInstallServerRunning() ? "Running - connect via USB" : "Press A to start");
+    brls::ListItem* mtpItem = new brls::ListItem("MTP Install Mode", "Install / transfer over USB");
+    mtpItem->setValue(inst::mtp::IsInstallServerRunning() ? "Running" : "Off");
     mtpItem->getClickEvent()->subscribe([mtpItem](brls::View*) {
         if (inst::mtp::IsInstallServerRunning()) {
             inst::mtp::StopInstallServer();
+            mtpItem->setValue("Off");
             brls::Application::notify("MTP stopped");
         } else {
             thrd_t t;
@@ -2123,10 +2247,31 @@ void populateOptionsList(brls::List* list) {
                 return 0;
             }, nullptr);
             thrd_detach(t);
+            mtpItem->setValue("Running");
             brls::Application::notify("MTP started - connect Switch to PC via USB");
         }
     });
     list->addView(mtpItem);
+
+
+    brls::ListItem* ftpItem = new brls::ListItem("FTP Install Mode", "install / transfer over network");
+    ftpItem->setValue(ftpIsRunning() ? std::string("Running ") + ftpGetIp() + ":5000" : "Off");
+    ftpItem->getClickEvent()->subscribe([ftpItem](brls::View*) {
+        if (ftpIsRunning()) {
+            ftpStop();
+            ftpItem->setValue("Off");
+            brls::Application::notify("FTP stopped");
+        } else {
+            if (ftpStart()) {
+                ftpItem->setValue(std::string("Running ") + ftpGetIp() + ":5000");
+                brls::Application::notify(std::string("FTP started at ") + ftpGetIp() + ":5000");
+            } else {
+                ftpItem->setValue("Off");
+                brls::Application::notify(std::string("FTP failed: ") + ftpGetStatus());
+            }
+        }
+    });
+    list->addView(ftpItem);
 
 
     brls::ListItem* updateItem = new brls::ListItem("Check for Updates", "Current version: " + inst::config::appVersion);
@@ -2135,15 +2280,13 @@ void populateOptionsList(brls::List* list) {
         thrd_t t;
         thrd_create(&t, [](void*) -> int {
             BgThreadGuard bgGuard;
-            FILE* dbgStart = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbgStart) { fprintf(dbgStart, "update thread started\n"); fclose(dbgStart); }
+            DBG_LOG("update thread started\n");
 
 
             std::string response = httpGet(
                 "https://raw.githubusercontent.com/eradicatinglove/The-Other-Side/main/version.txt");
 
-            FILE* dbgStart2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbgStart2) { fprintf(dbgStart2, "update response: size=%zu data='%.50s'\n", response.size(), response.c_str()); fclose(dbgStart2); }
+            DBG_LOG("update response: size=%zu data='%.50s'\n", response.size(), response.c_str());
 
             if (response.empty()) {
                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
@@ -2161,8 +2304,7 @@ void populateOptionsList(brls::List* list) {
             std::string currentVer = inst::config::appVersion;
             std::string tag = "v" + remoteVer;
 
-            FILE* dbg2 = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-            if (dbg2) { fprintf(dbg2, "update: current=%s remote=%s\n", currentVer.c_str(), remoteVer.c_str()); fclose(dbg2); }
+            DBG_LOG("update: current=%s remote=%s\n", currentVer.c_str(), remoteVer.c_str());
 
             if (remoteVer == currentVer) {
                 std::lock_guard<std::mutex> lock(g_pendingIconsMutex);
@@ -2183,6 +2325,8 @@ void populateOptionsList(brls::List* list) {
             g_titleNames.clear(); g_titleIconUrls.clear();
             g_titleIds.clear();
             g_titleUrls.clear();
+            g_titleKind.clear();
+            g_titleVersion.clear();
         }
         g_fetchDone   = false;
         g_fetchCancel = false;
@@ -2214,7 +2358,7 @@ void populateOptionsList(brls::List* list) {
 
 
                                 { std::lock_guard<std::mutex> lock(g_titleDataMutex);
-                                  g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); }
+                                  g_titleNames.clear(); g_titleIds.clear(); g_titleUrls.clear(); g_titleIconUrls.clear(); g_titleKind.clear(); g_titleVersion.clear(); }
                                 g_fetchDone = false; g_fetchCancel = false;
                                 thrd_t ft;
                                 thrd_create(&ft, [](void*)->int{ BgThreadGuard bgGuard; doFetch(); return 0; }, nullptr);
@@ -2246,6 +2390,75 @@ void frame_showOptions() {
 }
 
 
+// grid cell that reports its title name when focused, so the label above
+// the grid can show the full name (the cells themselves are icon-only)
+class InstalledCell : public brls::ListItem {
+public:
+    InstalledCell(const std::string& name, brls::Label* target)
+        : brls::ListItem(""), titleName(name), target(target) {}
+
+    void onFocusGained() override {
+        brls::ListItem::onFocusGained();
+        if (target)
+            target->setText(titleName);
+    }
+
+private:
+    std::string titleName;
+    brls::Label* target;
+};
+
+// tab frame with sd space + connection status drawn in the top right,
+// on top of the normal header so borealis itself stays untouched
+class StatusTabFrame : public brls::TabFrame {
+public:
+    void draw(NVGcontext* vg, int x, int y, unsigned width, unsigned height,
+               brls::Style* style, brls::FrameContext* ctx) override {
+        brls::TabFrame::draw(vg, x, y, width, height, style, ctx);
+
+        u64 now = armGetSystemTick();
+        u64 freq = armGetSystemTickFreq();
+        if (m_lastRefresh == 0 || (now - m_lastRefresh) >= freq * 5) {
+            m_lastRefresh = now;
+
+            struct statvfs st;
+            if (statvfs("sdmc:/", &st) == 0) {
+                double freeGB  = (double)(st.f_bavail * st.f_frsize) / (1024.0*1024.0*1024.0);
+                double totalGB = (double)(st.f_blocks * st.f_frsize) / (1024.0*1024.0*1024.0);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "SD: %.1f / %.1f GB free", freeGB, totalGB);
+                m_spaceText = buf;
+            } else {
+                m_spaceText = "SD: unavailable";
+            }
+
+            NifmInternetConnectionType connType;
+            u32 wifiStrength;
+            NifmInternetConnectionStatus connStatus;
+            Result rc = nifmGetInternetConnectionStatus(&connType, &wifiStrength, &connStatus);
+            if (R_SUCCEEDED(rc) && connStatus == NifmInternetConnectionStatus_Connected)
+                m_netText = (connType == NifmInternetConnectionType_WiFi) ? "Wi-Fi connected" : "Ethernet connected";
+            else
+                m_netText = "No internet connection";
+        }
+
+        std::string status = m_spaceText + "   |   " + m_netText;
+        if (status.empty()) return;
+
+        nvgFontSize(vg, 18);
+        nvgFontFaceId(vg, ctx->fontStash->regular);
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 200));
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+        nvgBeginPath(vg);
+        nvgText(vg, x + width - style->AppletFrame.separatorSpacing - 20,
+            y + style->AppletFrame.headerHeightRegular / 2, status.c_str(), nullptr);
+    }
+
+private:
+    u64 m_lastRefresh = 0;
+    std::string m_spaceText, m_netText;
+};
+
 // main app
 int main(int argc, char* argv[])
 {
@@ -2255,12 +2468,8 @@ int main(int argc, char* argv[])
         bool hasNextLoad = envHasNextLoad();
         Result rc = envSetNextLoad("sdmc:/switch/TheOtherSide/updater.nro",
                                     "sdmc:/switch/TheOtherSide/updater.nro");
-        FILE* dbg = fopen("sdmc:/switch/TheOtherSide/debug.txt", "a");
-        if (dbg) {
-            fprintf(dbg, "cold-start update handoff: envHasNextLoad=%s envSetNextLoad=0x%x (%s)\n",
+        DBG_LOG("cold-start update handoff: envHasNextLoad=%s envSetNextLoad=0x%x (%s)\n",
                     hasNextLoad ? "true" : "false", rc, R_SUCCEEDED(rc) ? "SUCCEEDED" : "FAILED");
-            fclose(dbg);
-        }
         return 0;
     }
 
@@ -2280,13 +2489,14 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    brls::TabFrame* rootFrame = new brls::TabFrame();
+    StatusTabFrame* rootFrame = new StatusTabFrame();
     rootFrame->setTitle("main/name"_i18n);
-    rootFrame->setIcon(BOREALIS_ASSET("icon/joycons.jpg"));
+    rootFrame->setIcon(BOREALIS_ASSET("icon/joycons.png"));
 
 
     brls::List* installedTab  = new brls::List();
-    brls::Label* installedStatusLabel = nullptr;
+    brls::Label* focusedNameLabel = new brls::Label(brls::LabelStyle::DESCRIPTION, "", false);
+    focusedNameLabel->setHorizontalAlign(NVG_ALIGN_CENTER);
     brls::List* fileBrowserTab = new brls::List();
     brls::List* shopTab       = new brls::List();
     brls::List* optionsTab    = new brls::List();
@@ -2294,41 +2504,6 @@ int main(int argc, char* argv[])
 
     {
 
-
-        installedStatusLabel = new brls::Label(brls::LabelStyle::DESCRIPTION, "", false);
-        installedStatusLabel->setHorizontalAlign(NVG_ALIGN_CENTER);
-
-        std::string statusText;
-
-
-        struct statvfs st;
-        if (statvfs("sdmc:/", &st) == 0) {
-            double freeGB  = (double)(st.f_bavail * st.f_frsize) / (1024.0*1024.0*1024.0);
-            double totalGB = (double)(st.f_blocks * st.f_frsize) / (1024.0*1024.0*1024.0);
-            char buf[64];
-            snprintf(buf, sizeof(buf), "SD: %.1f / %.1f GB free", freeGB, totalGB);
-            statusText += buf;
-        } else {
-            statusText += "SD: unavailable";
-        }
-
-        statusText += "   |   ";
-
-
-        NifmInternetConnectionType connType;
-        u32 wifiStrength;
-        NifmInternetConnectionStatus connStatus;
-        Result rc = nifmGetInternetConnectionStatus(&connType, &wifiStrength, &connStatus);
-        if (R_SUCCEEDED(rc) && connStatus == NifmInternetConnectionStatus_Connected) {
-            if (connType == NifmInternetConnectionType_WiFi)
-                statusText += "Wi-Fi connected";
-            else
-                statusText += "Ethernet connected";
-        } else {
-            statusText += "No internet connection";
-        }
-
-        installedStatusLabel->setText(statusText);
 
         NsApplicationRecord* records = new NsApplicationRecord[4096]();
         s32 count = 0;
@@ -2372,7 +2547,7 @@ int main(int argc, char* argv[])
                 }
 
 
-                brls::ListItem* cell = new brls::ListItem("");
+                InstalledCell* cell = new InstalledCell(name, focusedNameLabel);
                 cell->setWidth(148);
                 if (iconBuf)
                     cell->setThumbnail(iconBuf, iconSize);
@@ -2405,18 +2580,41 @@ int main(int argc, char* argv[])
     openFiles->getClickEvent()->subscribe([](brls::View*) { frame_showFileBrowser("sdmc:/"); });
     fileBrowserTab->addView(openFiles);
 
+    brls::ListItem* browseHdd = new brls::ListItem("Browse USB drive", "Mounts a connected USB drive and opens it here");
+    browseHdd->getClickEvent()->subscribe([](brls::View*) {
+        if (!nx::hdd::init()) {
+            brls::Application::notify("Failed to start USB drive support");
+            return;
+        }
+        if (nx::hdd::count() == 0) {
+            brls::Application::notify("No USB drive detected - plug one in and try again");
+            return;
+        }
+        const char* root = nx::hdd::rootPath(0);
+        if (!root) {
+            brls::Application::notify("No USB drive detected - plug one in and try again");
+            return;
+        }
+        frame_showFileBrowser(std::string(root) + "/");
+    });
+    fileBrowserTab->addView(browseHdd);
+
     brls::ListItem* openGames = new brls::ListItem("Games", "Base games");
     openGames->getClickEvent()->subscribe([](brls::View*) { frame_showShop("Games", "games"); });
     shopTab->addView(openGames);
 
-    brls::ListItem* openUpdates = new brls::ListItem("Updates & DLC", "Game updates and DLC");
-    openUpdates->getClickEvent()->subscribe([](brls::View*) { frame_showShop("Updates & DLC", "updates"); });
+    brls::ListItem* openUpdates = new brls::ListItem("Updates", "Game updates");
+    openUpdates->getClickEvent()->subscribe([](brls::View*) { frame_showShop("Updates", "updates"); });
     shopTab->addView(openUpdates);
+
+    brls::ListItem* openDlc = new brls::ListItem("DLC", "Downloadable content");
+    openDlc->getClickEvent()->subscribe([](brls::View*) { frame_showShop("DLC", "dlc"); });
+    shopTab->addView(openDlc);
 
 
     populateOptionsList(optionsTab);
 
-    inst::ui::PinnedStatusView* installedPinned = new inst::ui::PinnedStatusView(installedStatusLabel, installedTab);
+    inst::ui::PinnedStatusView* installedPinned = new inst::ui::PinnedStatusView(focusedNameLabel, installedTab);
     rootFrame->addTab("Installed",    installedPinned);
     rootFrame->addTab("File Browser", fileBrowserTab);
     rootFrame->addSeparator();
@@ -2448,6 +2646,9 @@ int main(int argc, char* argv[])
     if (inst::mtp::IsInstallServerRunning())
         inst::mtp::StopInstallServer();
 
+    if (ftpIsRunning())
+        ftpStop();
+
 
     thrd_join(fetchThrd, nullptr);
 
@@ -2460,10 +2661,13 @@ int main(int argc, char* argv[])
     g_titleIconUrls.clear(); g_titleIconUrls.shrink_to_fit();
     g_titleIds.clear();   g_titleIds.shrink_to_fit();
     g_titleUrls.clear();  g_titleUrls.shrink_to_fit();
+    g_titleKind.clear();  g_titleKind.shrink_to_fit();
+    g_titleVersion.clear(); g_titleVersion.shrink_to_fit();
     g_iconCacheSet.clear();
     g_iconIndex.clear();
 
     curl_global_cleanup();
+    nx::hdd::exit();
     spsmExit();
     nsExit();
 
